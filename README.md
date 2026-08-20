@@ -1,32 +1,52 @@
 # piece_of_wm
 
-PETS (Probabilistic Ensembles with Trajectory Sampling) world-model example,
-split from `01_pets_pendulum.ipynb` into command-line modules.
+World-model data collection utilities with a sequence-preserving replay buffer.
 
 ```bash
 ./venv.sh
 source .venv/bin/activate
 
-# Save random real-environment transitions.
-./run_collect_data.sh --env-id Pendulum-v1 --episodes 10 --output-dir dataset/pendulum-random
-
-# Train only the dynamics ensemble from saved data.
-./pets/run_train_offline.sh --data-dir dataset/pendulum-random --output-dir runs/pets-offline
-
-# Alternate model fitting, CEM/MPC control, and real data collection.
-./pets/run_train_online.sh --initial-episodes 1 --trials 6 --output-dir runs/pets-online
-
-# Evaluate a checkpoint and save an MP4 under runs/pets-eval/videos/.
-./pets/run_eval.sh --model-dir runs/pets-offline --output-dir runs/pets-eval
+# Each rollout file contains NUM_ENVS complete episodes and optional 128x128 images.
+NUM_ENVS=4 ROLLOUTS=100 ./run_collect_data.sh --env-id Pendulum-v1 --output-dir dataset/pendulum-random
 ```
 
-`utils/env.py` owns Gymnasium setup and space validation. `utils/data.py` owns
-the mbrl replay buffer and portable dataset files. `utils/common.py` owns
-seeding, logging, plots, and checkpoints. `pets/model.py` owns the PETS model,
-model environment, CEM planner, and model-training loop.
+`collect_data.py` writes complete episode batches. `utils/replay_buffer.py`
+keeps a fixed number of those batches in RAM and mirrors them under
+`runs/.../replay_buffer` for restart recovery.
 
-The current `GaussianMLP` PETS model is intentionally limited to vector
-observations, so it runs on `Pendulum-v1`. `collect_data.py` can also store
-continuous-control image observations such as `CarRacing-v2`, but PETS training
-will report that an image encoder/latent dynamics model is required rather than
-flattening pixels silently.
+Each rollout stores `obs` with shape `(NUM_ENVS, T + 1, ...)`, transition arrays
+with shape `(NUM_ENVS, T, ...)`, and `lengths` to mask padded time steps.
+
+## Train Trans-WM
+
+After collecting image rollouts, train the CNN/Transformer world model with:
+
+```bash
+./run_train_trans_wm.sh
+```
+
+The default input is `dataset/pendulum-random`, and checkpoints and metrics are
+written to `runs/trans_wm`. Common overrides are supplied through environment
+variables:
+
+```bash
+DATA_DIR=dataset/pendulum-random \
+OUTPUT_DIR=runs/trans_wm-pendulum \
+ROLLOUTS=500 NUM_ENVS=10 MAX_STEPS=200 \
+BATCH_SIZE=16 DEVICE=cuda \
+./run_train_trans_wm.sh
+```
+
+`NUM_ENVS` and `MAX_STEPS` are checked against `dataset.json` before training,
+so the training configuration cannot silently disagree with the collected
+rollout layout.
+
+The script samples bounded transition batches from the sequence rollouts, so it
+does not materialize all ten-frame windows for an entire dataset in memory. To
+continue from a checkpoint, set `RESUME` and keep the matching model/training
+arguments in `EXTRA_ARGS`:
+
+```bash
+RESUME=runs/trans_wm/checkpoint.pt ROLLOUTS=1000 \
+./run_train_trans_wm.sh
+```

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 ###############################################################################
-# Random real-environment data collection for PETS world-model training.
+# Random real-environment episode collection for world-model training.
 #
 # Usage:
 #   ./run_collect_data.sh
-#   ENV_ID=Pendulum-v1 EPISODES=20 SEED=42 ./run_collect_data.sh
+#   ENV_ID=Pendulum-v1 ROLLOUTS=20 SEED=42 ./run_collect_data.sh
 #
 # Tunables (env vars):
 #   PYTHON      : Python interpreter (takes precedence over virtualenv choices)
 #   ENV_ID      : Gymnasium environment (default: Pendulum-v1)
-#   EPISODES    : number of random-policy episodes (default: 10)
-#   MAX_STEPS   : maximum steps per episode (default: 200)
+#   ROLLOUTS    : number of random-policy rollouts (default: 100)
+#   MAX_STEPS   : maximum steps per environment trajectory in a rollout (default: 200)
+#   NUM_ENVS    : environments included in every rollout (default: 10)
 #   SEED        : random seed (default: 0)
-#   OUTPUT_DIR  : directory for replay_buffer.npz (default: data/pendulum-random)
+#   OUTPUT_DIR  : directory for per-rollout .npz files (default: data/pendulum-random)
 #   EXTRA_ARGS  : extra CLI arguments forwarded to collect_data.py
 ###############################################################################
 set -u
@@ -36,22 +37,24 @@ if [ ! -x "${PYTHON}" ]; then
 fi
 
 ENV_ID="${ENV_ID:-Pendulum-v1}"
-EPISODES="${EPISODES:-10}"
+ROLLOUTS="${ROLLOUTS:-20}"
 MAX_STEPS="${MAX_STEPS:-200}"
+NUM_ENVS="${NUM_ENVS:-10}"
 SEED="${SEED:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-dataset/pendulum-random}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-echo "[run_collect_data] env_id=${ENV_ID} episodes=${EPISODES} max_steps=${MAX_STEPS} seed=${SEED}"
+echo "[run_collect_data] env_id=${ENV_ID} rollouts=${ROLLOUTS} max_steps=${MAX_STEPS} num_envs=${NUM_ENVS} seed=${SEED}"
 echo "[run_collect_data] output_dir=${OUTPUT_DIR}"
 
 # shellcheck disable=SC2086
 "${PYTHON}" "${SCRIPT_DIR}/collect_data.py" \
 	--env-id "${ENV_ID}" \
-	--episodes "${EPISODES}" \
+	--rollouts "${ROLLOUTS}" \
 	--max-steps "${MAX_STEPS}" \
+	--num-envs "${NUM_ENVS}" \
 	--seed "${SEED}" \
 	--output-dir "${OUTPUT_DIR}" \
 	${EXTRA_ARGS} \

@@ -25,8 +25,6 @@ source .venv/bin/activate
 
 # Install dependencies
 uv pip install --upgrade torch --index-url https://mirrors.aliyun.com/pypi/simple/
-uv pip install "gymnasium[classic-control]==1.3.0"
-uv pip install hydra-core omegaconf termcolor tqdm matplotlib moviepy
-uv pip install --no-deps mbrl==0.2.0
+uv pip install numpy Pillow tqdm "gymnasium[classic-control]==1.3.0"
 
 cd $CUR_DIR
