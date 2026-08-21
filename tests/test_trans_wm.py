@@ -14,7 +14,7 @@ from trans_wm import (
     WorldModel,
     WorldModelConfig,
     WorldModelTrainer,
-    bellman_target,
+    discounted_returns,
     sample_transition_batch,
     tensor_episode_batch,
     world_model_loss,
@@ -112,7 +112,7 @@ class WorldModelShapeTest(unittest.TestCase):
         )
 
     def test_heads_read_one_z_and_reconstruct_ten_images(self) -> None:
-        output = self.model.predict_heads(torch.randn(3, 8))
+        output = self.model.predict_heads(torch.randn(3, 8), torch.randn(3, 2))
 
         self.assertEqual(output.observation.shape, (3, OBS_HISTORY_LEN, 3, 32, 32))
         self.assertEqual(output.reward.shape, (3, 1))
@@ -150,6 +150,29 @@ class WorldModelShapeTest(unittest.TestCase):
 
 
 class WorldModelTrainingTest(unittest.TestCase):
+    def test_discounted_returns_are_aligned_with_current_state(self) -> None:
+        returns = discounted_returns(torch.tensor([1.0, 2.0, 3.0]), gamma=0.5)
+        torch.testing.assert_close(returns, torch.tensor([2.75, 3.5, 3.0]))
+
+    def test_replay_update_does_not_train_value_head(self) -> None:
+        model = WorldModel(_config())
+        trainer = WorldModelTrainer(model, TrainingConfig())
+        before = [parameter.detach().clone() for parameter in model.heads.value_head.parameters()]
+        trainer.train_transitions(_batch(), batch_size=3, rng=np.random.default_rng(1))
+        for previous, current in zip(before, model.heads.value_head.parameters(), strict=True):
+            torch.testing.assert_close(previous, current, rtol=0.0, atol=0.0)
+
+    def test_reward_is_conditioned_on_current_latent_and_action(self) -> None:
+        model = WorldModel(_config())
+        z = torch.randn(2, model.config.latent_dim)
+        low = model.heads.reward(z, -torch.ones(2, model.config.action_dim))
+        high = model.heads.reward(z, torch.ones(2, model.config.action_dim))
+        self.assertFalse(torch.equal(low, high))
+        self.assertEqual(
+            model.heads.reward_head[1].in_features,
+            model.config.latent_dim + model.config.action_dim,
+        )
+
     def test_transition_sampler_preserves_frame_history_alignment(self) -> None:
         model = WorldModel(_config())
         sampled = sample_transition_batch(
@@ -172,15 +195,6 @@ class WorldModelTrainingTest(unittest.TestCase):
         loss = vae_kl_loss(mean, log_variance)
 
         torch.testing.assert_close(loss, torch.zeros(2))
-
-    def test_bellman_target_uses_next_state_value(self) -> None:
-        reward = torch.tensor([[1.0], [2.0]])
-        next_value = torch.tensor([[10.0], [20.0]])
-        terminated = torch.tensor([[False], [True]])
-
-        target = bellman_target(reward, next_value, terminated, gamma=0.9)
-
-        torch.testing.assert_close(target, torch.tensor([[10.0], [2.0]]))
 
     def test_image_batch_conversion_and_training_losses(self) -> None:
         torch.manual_seed(8)

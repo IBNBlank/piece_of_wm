@@ -43,10 +43,48 @@ rollout layout.
 
 The script samples bounded transition batches from the sequence rollouts, so it
 does not materialize all ten-frame windows for an entire dataset in memory. To
-continue from a checkpoint, set `RESUME` and keep the matching model/training
-arguments in `EXTRA_ARGS`:
+continue from a checkpoint, set `RESUME` to a checkpoint file or the run
+directory and keep the matching model/training arguments in `EXTRA_ARGS`. A run
+directory automatically selects its newest numbered checkpoint:
 
 ```bash
-RESUME=runs/trans_wm/checkpoint.pt ROLLOUTS=1000 \
+RESUME=runs/trans_wm ROLLOUTS=1000 \
 ./run_train_trans_wm.sh
 ```
+
+At startup, training imports the rollout files into a RAM-resident
+`RolloutReplayBuffer` and mirrors them under `OUTPUT_DIR/replay_buffer`. Each
+training unit combines two randomly selected complete rollout batches by
+default (`SAMPLE_ROLLOUTS=2`) before sampling transitions. Periodic evaluation
+uses a fixed transition sample.
+
+Replay updates train the encoder, dynamics, and action-conditioned reward model
+`R(z_t, a_t)`. They do not update the value head. Each training unit also runs
+the current particle policy in the real Gymnasium environment (two complete
+episodes by default, `VALUE_ROLLOUTS=2`) and trains only `V(z_t)` against the
+Monte Carlo return-to-go with `gamma=0.95`. Every 10 training rollouts, the
+policy is evaluated over 10 separate episodes. The two newest numbered
+checkpoints are retained for resuming, while `checkpoint_best.pt` retains the
+highest evaluation return.
+
+The action-conditioned reward head is an architecture change. Older checkpoints
+are rejected explicitly and must be retrained from scratch.
+
+## Online evaluation
+
+`run_eval.sh` evaluates the checkpoint by resetting and stepping the real
+Gymnasium environment. Candidate actions are selected with the particle policy;
+the rollout dataset is not used by evaluation.
+
+```bash
+MODEL=trans_wm_le \
+TRANS_WM_LE_CHECKPOINT=runs/trans_wm_le/checkpoint_best.pt \
+EPISODES=5 DEVICE=cuda \
+./run_eval.sh
+```
+
+Results include per-episode online returns, a same-seed random-policy baseline,
+an online return plot, and a GIF recorded from the first environment episode.
+The default planning horizon is one model step. Longer model planning must be
+requested explicitly with `PLANNING_HORIZON` and should only be used after
+multi-step prediction quality has been validated.

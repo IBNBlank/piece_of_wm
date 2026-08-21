@@ -17,7 +17,11 @@ class WorldModelConfig:
     observation_dim: int = 128
     latent_dim: int = 64
     model_dim: int = 256
+    num_layers: int = 3
+    num_heads: int = 4
+    feedforward_dim: int = 512
     cnn_channels: tuple[int, ...] = (32, 64, 128)
+    dropout: float = 0.0
     gamma: float = 0.99
     target_ema: float = 0.99
 
@@ -28,10 +32,20 @@ class WorldModelConfig:
             raise ValueError("action_shape must contain positive dimensions.")
         if not self.cnn_channels or any(size <= 0 for size in self.cnn_channels):
             raise ValueError("cnn_channels must contain positive dimensions.")
-        if self.observation_dim <= 0 or self.model_dim <= 0:
+        if (
+            self.observation_dim <= 0
+            or self.model_dim <= 0
+            or self.feedforward_dim <= 0
+        ):
             raise ValueError("Model dimensions must be positive.")
         if self.latent_dim != 64:
             raise ValueError("latent_dim is fixed at 64 for trans_wm_le.")
+        if self.num_layers <= 0 or self.num_heads <= 0:
+            raise ValueError("num_layers and num_heads must be positive.")
+        if self.model_dim % self.num_heads:
+            raise ValueError("model_dim must be divisible by num_heads.")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
         if not 0.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be in [0, 1].")
         if not 0.0 <= self.target_ema < 1.0:

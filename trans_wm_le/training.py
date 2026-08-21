@@ -228,19 +228,18 @@ def sigreg_loss(
     return ((empirical_real - gaussian_real).square() + empirical_imag.square()).mean()
 
 
-def bellman_target(
-    reward: torch.Tensor,
-    next_value: torch.Tensor,
-    terminated: torch.Tensor,
-    gamma: float,
-) -> torch.Tensor:
-    if reward.shape != next_value.shape or reward.shape != terminated.shape:
-        raise ValueError("reward, next_value, and terminated shapes must match.")
-    if terminated.dtype != torch.bool:
-        raise ValueError("terminated must be boolean.")
+def discounted_returns(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Monte Carlo return-to-go for one complete online episode."""
+    if rewards.ndim != 1 or rewards.numel() == 0:
+        raise ValueError("rewards must be a non-empty one-dimensional tensor.")
     if not 0.0 <= gamma <= 1.0:
         raise ValueError("gamma must be in [0, 1].")
-    return reward + gamma * (~terminated) * next_value
+    returns = torch.empty_like(rewards)
+    running = rewards.new_zeros(())
+    for timestep in range(rewards.shape[0] - 1, -1, -1):
+        running = rewards[timestep] + gamma * running
+        returns[timestep] = running
+    return returns
 
 
 def world_model_loss(
@@ -261,8 +260,7 @@ def world_model_loss(
     ).reshape(batch_size, states, model.config.latent_dim)
     current_z = online_latents[:, :-1].flatten(0, 1)
     predicted_next_z = model.predict_next_online(current_z, batch.actions.flatten(0, 1))
-    current_heads = model.predict_heads_online(current_z)
-    predicted_next_heads = model.predict_heads_online(predicted_next_z)
+    reward_target = batch.rewards.flatten(0, 1)
 
     with torch.no_grad():
         target_next_z = model.encode_ema(
@@ -271,25 +269,16 @@ def world_model_loss(
             action_windows[:, 1:].flatten(0, 1),
             action_masks[:, 1:].flatten(0, 1),
         )
-        target_next_value = model.ema_heads.value_head(target_next_z)
-        reward_target = batch.rewards.flatten(0, 1)
-        value_target = bellman_target(
-            reward_target,
-            target_next_value,
-            batch.terminated.flatten(0, 1).unsqueeze(-1),
-            model.config.gamma,
-        )
 
     valid = batch.transition_valid.flatten().to(dtype=current_z.dtype)
     jepa = _masked_mean((predicted_next_z - target_next_z).square().mean(dim=-1), valid)
     reward = _masked_mean(
-        (predicted_next_heads.reward - reward_target).square().squeeze(-1), valid
+        (model.heads.reward(current_z, batch.actions.flatten(0, 1)) - reward_target)
+        .square()
+        .squeeze(-1),
+        valid,
     )
-    value_errors = 0.5 * (
-        (current_heads.value - value_target).square()
-        + (predicted_next_heads.value - target_next_value).square()
-    )
-    value = _masked_mean(value_errors.squeeze(-1), valid)
+    value = reward.new_zeros(())
     sigreg = sigreg_loss(
         online_latents[batch.state_valid],
         config.sigreg_projections,
@@ -300,7 +289,6 @@ def world_model_loss(
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
-        + config.value_weight * value
     )
     return WorldModelLosses(total, jepa, sigreg, reward, value)
 
@@ -326,18 +314,12 @@ def transition_world_model_loss(
         next_action_valid,
     )
     predicted_next_z = model.predict_next_online(current_z, batch.action)
-    current_heads = model.predict_heads_online(current_z)
-    predicted_next_heads = model.predict_heads_online(predicted_next_z)
     with torch.no_grad():
         target_next_z = model.encode_ema(
             batch.next_observations,
             batch.next_obs_valid,
             next_action_history,
             next_action_valid,
-        )
-        target_next_value = model.ema_heads.value_head(target_next_z)
-        value_target = bellman_target(
-            batch.reward, target_next_value, batch.terminated, model.config.gamma
         )
 
     jepa = (predicted_next_z - target_next_z).square().mean()
@@ -347,16 +329,12 @@ def transition_world_model_loss(
         config.sigreg_frequencies,
         config.sigreg_max_frequency,
     )
-    reward = (predicted_next_heads.reward - batch.reward).square().mean()
-    value = 0.5 * (
-        (current_heads.value - value_target).square().mean()
-        + (predicted_next_heads.value - target_next_value).square().mean()
-    )
+    reward = (model.heads.reward(current_z, batch.action) - batch.reward).square().mean()
+    value = reward.new_zeros(())
     total = (
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
-        + config.value_weight * value
     )
     return WorldModelLosses(total, jepa, sigreg, reward, value)
 
@@ -365,8 +343,18 @@ class WorldModelTrainer:
     def __init__(self, model: WorldModel, config: TrainingConfig | None = None) -> None:
         self.model = model
         self.config = config or TrainingConfig()
+        value_parameters = set(model.heads.value_head.parameters())
         self.optimizer = torch.optim.AdamW(
-            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            (
+                parameter
+                for parameter in model.parameters()
+                if parameter.requires_grad and parameter not in value_parameters
+            ),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+        self.value_optimizer = torch.optim.AdamW(
+            model.heads.value_head.parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
@@ -393,6 +381,39 @@ class WorldModelTrainer:
         losses.total.backward()
         self._finish_step()
         return losses.detached()
+
+    def evaluate_transitions(
+        self,
+        batch: EpisodeBatch,
+        batch_size: int,
+        rng: np.random.Generator,
+    ) -> dict[str, float]:
+        self.model.eval()
+        sampled = sample_transition_batch(batch, self.model, batch_size, rng)
+        with torch.inference_mode():
+            return transition_world_model_loss(self.model, sampled, self.config).detached()
+
+    def train_value_rollout(
+        self, latents: torch.Tensor, returns: torch.Tensor
+    ) -> dict[str, float]:
+        """Fits V(z_t) to return-to-go from the current policy's real rollout."""
+        if latents.ndim != 2 or latents.shape[1] != self.model.config.latent_dim:
+            raise ValueError("latents must have shape [time, latent_dim].")
+        returns = returns.reshape(-1, 1)
+        if returns.shape[0] != latents.shape[0]:
+            raise ValueError("latents and returns must have the same time dimension.")
+        self.model.train()
+        self.value_optimizer.zero_grad(set_to_none=True)
+        prediction = self.model.heads.value_head(latents.detach())
+        loss = (prediction - returns.detach()).square().mean()
+        (self.config.value_weight * loss).backward()
+        if self.config.grad_clip_norm is not None:
+            nn.utils.clip_grad_norm_(
+                self.model.heads.value_head.parameters(), self.config.grad_clip_norm
+            )
+        self.value_optimizer.step()
+        self.model.update_target()
+        return {"value": loss.detach().item()}
 
     def _finish_step(self) -> None:
         if self.config.grad_clip_norm is not None:

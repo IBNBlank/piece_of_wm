@@ -1,13 +1,15 @@
-# Trans-WM-LE：图像历史 JEPA 世界模型
+# Trans-WM-LE：图像历史 JEPA Transformer 世界模型
 
 `trans_wm_le` 实现一个与 policy 完全解耦的 action-conditioned latent JEPA world model。模型不包含图像 decoder、VAE、生成式 dynamics、RSSM prior/posterior、actor、CEM 或 MPC。
+
+训练循环的完整执行顺序、数据对齐和参数更新范围见 [TRAINING_LOGIC.md](TRAINING_LOGIC.md)。
 
 模型将表示明确分成两层：
 
 - 最近 10 帧图像经过 CNN 得到 `obs tensor`；
 - `obs tensor` 与最近 9 个已执行 action 组成的 `ah tensor` 经过小型 MLP，得到固定 64 维 `latent state`。
 
-外部 policy 给出当前 action 后，MLP Dynamics 根据当前 latent 和 action 预测下一个 latent。训练时，预测 latent 通过 JEPA loss 对齐由下一真实 observation 和更新后 action history 编码得到的 EMA target latent，并使用 SIGReg 防止表示坍塌。
+外部 policy 给出当前 action 后，Transformer Dynamics 根据当前 latent 和 action 预测下一个 latent。训练时，预测 latent 通过 JEPA loss 对齐由下一真实 observation 和更新后 action history 编码得到的 EMA target latent，并使用 SIGReg 防止表示坍塌。
 
 ## 运行框架
 
@@ -43,12 +45,13 @@ flowchart LR
 
     subgraph Dynamics[确定性 Latent Dynamics]
         A["外部 policy 给出的 a(t)<br/>B x A"]
-        CAT2["concat(z(t), a(t))"]
-        DMLP["三层 MLP"]
+        ZTOKEN["z token"]
+        ATOKEN["当前 action token"]
+        TRANSFORMER["Transformer Encoder<br/>固定 2 个 token"]
         ZP["预测 latent z_hat(t+1)<br/>B x 64"]
-        Z --> CAT2
-        A --> CAT2
-        CAT2 --> DMLP --> ZP
+        Z --> ZTOKEN --> TRANSFORMER
+        A --> ATOKEN --> TRANSFORMER
+        TRANSFORMER -->|读取 z token 对位输出| ZP
     end
 
     subgraph Heads[直接读取 latent 的预测头]
@@ -155,12 +158,13 @@ z_t: [B, 64]
 
 ## Latent Dynamics
 
-Dynamics 是确定性的 MLP，只读取当前 latent 和当前 action：
+Dynamics 是确定性的 Transformer Encoder，只读取当前 latent 和当前 action。输入序列固定为两个 token：
 
 ```text
-dynamics_input_t = concat(z_t, a_t)
+1. z_t token
+2. current action a_t token
 
-z_hat_{t+1} = MLP(dynamics_input_t)
+z_hat_{t+1} = Transformer(z_t token, a_t token)[z position]
 
 z_t:           [B, 64]
 a_t:           [B, action_dim]
@@ -169,11 +173,11 @@ z_hat_{t+1}:   [B, 64]
 
 Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 `z_t`，因此再次送入 Dynamics 会重复建模同一信息。
 
-这里没有 Transformer、概率分布、noise 或 sampling。相同输入始终产生相同的预测 latent。
+两个输入分别经过独立 Linear projection 映射到 `model_dim`，加上位置 embedding 后进入 Transformer，最后读取 `z_t` token 对应位置并映射回 64 维。这里没有概率分布、noise 或 sampling；当 `dropout=0` 时，相同输入始终产生相同的预测 latent。
 
 ## Heads 与 Action Score
 
-模型不再包含 Observation Head 或图像 decoder。只保留 Reward Head 和 Value Head，二者都读取单个 64 维 latent。
+模型不再包含 Observation Head 或图像 decoder。Reward Head 读取 64 维 latent 和当前 action，Value Head 只读取 latent。
 
 ### Reward Head
 
@@ -183,10 +187,10 @@ Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 
 z_t --a_t, r_t--> z_{t+1}
 ```
 
-训练和 rollout 都在预测的下一状态上计算 reward：
+训练和 rollout 都从当前 latent 和当前 action 计算 reward：
 
 ```text
-r_hat_t = RewardHead(z_hat_{t+1})
+r_hat_t = RewardHead(z_t, a_t)
 r_hat_t: [B, 1]
 ```
 
@@ -209,7 +213,7 @@ value_hat: [B, 1]
 z_hat_{t+1} = Dynamics(z_t, a_t)
 
 score(z_t, a_t)
-    = RewardHead(z_hat_{t+1})
+    = RewardHead(z_t, a_t)
     + gamma * ValueHead(z_hat_{t+1})
 ```
 
@@ -229,7 +233,7 @@ action mask: [ 0   0   0   0   0   0   0  1  1]
 
 mask 在进入 CNN 或 Latent Encoder 前显式清零 padding 值。训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition，并使用 `state_valid` 排除 SIGReg 中的无效状态。
 
-真正的 `terminated` 会停止 Value bootstrap；时间限制产生的 `truncated` 不会被当作终止状态，仍从最后一个有效图像状态 bootstrap。
+Value 使用完整在线 episode 的 Monte Carlo return，不执行 terminal bootstrap。
 
 ## 训练时间对齐
 
@@ -249,8 +253,7 @@ append(ah_t, a_t)                -> ah_{t+1}
 concat(obs_tensor_{t+1}, ah_{t+1})
                                   -> z_target_{t+1}
 
-RewardHead(z_hat_{t+1})          -> r_hat_t
-ValueHead(z_t)                    -> V_hat_t
+RewardHead(z_t, a_t)             -> r_hat_t
 ValueHead(z_hat_{t+1})           -> predicted next value
 ```
 
@@ -347,35 +350,21 @@ sigreg_max_frequency = 5.0
 ### Reward Loss
 
 ```text
-L_reward(t) = (RewardHead(z_hat_{t+1}) - r_t)^2
+L_reward(t) = (RewardHead(z_t, a_t) - r_t)^2
 ```
 
-Reward loss 会同时更新在线 Dynamics 和 Reward Head。
+Reward loss 更新 Encoder 和 Reward Head；Dynamics 由 JEPA loss 更新。
 
 ### Value Loss
 
-EMA Value Head 在真实下一 target latent 上构造 Bellman target：
+Value 不从 replay buffer 更新。每个训练单元用当前粒子策略执行真实在线 episode，并计算 return-to-go：
 
 ```text
-V_target_next = EMAValueHead(z_target_{t+1})
-
-y_t = r_t + gamma * (1 - terminated_t) * V_target_next
+G_t = r_t + gamma * G_{t+1}
+L_value(t) = (ValueHead(stop_gradient(z_t)) - G_t)^2
 ```
 
-在线 Value Head 同时监督当前真实 latent 和预测下一 latent：
-
-```text
-L_current_value(t)
-    = (ValueHead(z_t) - stop_gradient(y_t))^2
-
-L_predicted_value(t)
-    = (ValueHead(z_hat_{t+1}) - stop_gradient(V_target_next))^2
-
-L_value(t)
-    = 0.5 * (L_current_value(t) + L_predicted_value(t))
-```
-
-这样 policy 实际使用的 `z_hat_{t+1}` 也具有经过监督的 Value。
+在线 latent 来自冻结的 EMA encoder，value optimizer 只更新 Value Head；replay optimizer 明确排除 Value Head。
 
 ### 总损失
 
@@ -386,7 +375,6 @@ L_total =
     jepa_weight   * L_JEPA
     + sigreg_weight * L_SIGReg
     + reward_weight * L_reward
-    + value_weight  * L_value
 ```
 
 四项权重默认均为 `1.0`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
@@ -417,7 +405,7 @@ z_t = model.encode(
 )
 
 z_next = model.predict_next(z_t, action)
-heads = model.predict_heads(z_next)
+heads = model.predict_heads(z_next, action)
 evaluation = model.evaluate_action(z_t, action)
 rollout = model.rollout(z_t, action_history, external_actions, action_valid_mask)
 ```
@@ -441,6 +429,10 @@ model = WorldModel(
         observation_dim=128,
         latent_dim=64,  # trans_wm_le 中固定为 64
         model_dim=256,
+        num_layers=3,
+        num_heads=4,
+        feedforward_dim=512,
+        dropout=0.0,
     )
 )
 
@@ -470,7 +462,7 @@ z_t = model.encode(
 z_next = model.predict_next(z_t, action)
 
 # 从 latent 预测 reward、value，并计算 Q-style score。
-heads = model.predict_heads(z_next)
+heads = model.predict_heads(z_next, action)
 evaluation = model.evaluate_action(z_t, action)
 q_score = evaluation.score
 

@@ -159,7 +159,13 @@ reward_hat: [B, 1]
 z_t --a_t--> z_{t+1}, reward r_t
 ```
 
-训练时使用真实 `z_{t+1}` 预测 `r_t`。因此 rollout 中由 action 得到 `z_hat_{t+1}` 后，Reward Head 给出的就是该 action 对应的预测 reward。
+训练和 rollout 都直接使用 `(z_t, a_t)` 预测 `r_t`：
+
+```text
+r_hat_t = RewardHead(z_t, a_t)
+```
+
+这与 Pendulum 在状态积分前由当前状态和 action 计算 reward 的时间语义一致。
 
 ### Value Head
 
@@ -178,7 +184,7 @@ value_hat: [B, 1]
 z_hat_{t+1} = Dynamics(z_t, ah_t, a_t)
 
 score(z_t, a_t)
-    = reward_hat(z_hat_{t+1})
+    = reward_hat(z_t, a_t)
     + gamma * value_hat(z_hat_{t+1})
 ```
 
@@ -196,7 +202,7 @@ actions:    [PAD PAD PAD PAD PAD PAD PAD a0 a1]
 action mask:[ 0   0   0   0   0   0   0  1  1]
 ```
 
-训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。真正的 `terminated` 会停止 Value bootstrap；时间限制产生的 `truncated` 仍从最后一个有效图像状态 bootstrap。
+训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。Value 使用完整在线 episode 的 Monte Carlo return，不执行 terminal bootstrap。
 
 ## 训练时间对齐
 
@@ -250,17 +256,14 @@ L_vae_kl = -0.5 * mean(1 + log_variance - mean^2 - exp(log_variance))
 
 ### Value 损失
 
-EMA target Value Head 在真实下一状态 `z_{t+1}` 上构造 Bellman target：
+Value 不使用 replay transition 的 Bellman target。每个训练单元执行当前粒子策略的真实在线 episode，并计算 Monte Carlo return-to-go：
 
 ```text
-y_t = r_t + gamma * (1 - terminated_t) * V_target(z_{t+1})
-
-L_value(t) = (V_hat(z_t) - sg(y_t))^2
-
-L_pred_value(t) = (V_hat(z_hat_{t+1}) - sg(V_ema(z_{t+1})))^2
+G_t = r_t + gamma * G_{t+1}
+L_value(t) = (V_hat(sg(z_t)) - G_t)^2
 ```
 
-实现中的 Value loss 是上述两项的平均值，使 policy 实际使用的预测状态 `z_hat_{t+1}` 也具有经过监督的 Value，同时不要求 `z_hat_{t+1}` 在数值上匹配 encoder latent。
+在线 rollout 使用冻结的 EMA encoder 产生 `z_t`，value 更新只修改在线 Value Head。Replay optimizer 明确排除 Value Head。
 
 EMA 参数在每次训练更新后更新，覆盖 Encoder、Dynamics 和全部 Heads：
 
@@ -278,7 +281,6 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 L_total =
     observation_weight * L_obs
     + reward_weight * L_reward
-    + value_weight * L_value
     + vae_reconstruction_weight * L_vae_recon
     + vae_kl_weight * L_vae_kl
 ```
@@ -292,7 +294,7 @@ L_total =
 ```python
 z_t = model.encode(obs_history, obs_valid_mask)
 z_next = model.predict_next(z_t, action_history, action)
-heads = model.predict_heads(z_next)
+heads = model.predict_heads(z_next, action)
 evaluation = model.evaluate_action(z_t, action_history, action)
 rollout = model.rollout(z_t, action_history, external_actions)
 ```
@@ -324,7 +326,7 @@ ah_t = model.action_history_tensor(action_history, action_valid_mask)
 z_next = model.predict_next(z_t, ah_t, action)
 
 # 直接从 z 预测 10 张图像、reward 和完整 state value。
-heads = model.predict_heads(z_t)
+heads = model.predict_heads(z_t, action)
 
 # 预测 action-conditioned next state 及其 Q-style score。
 evaluation = model.evaluate_action(

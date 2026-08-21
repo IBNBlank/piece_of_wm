@@ -91,6 +91,12 @@ class RolloutReplayBuffer:
     def num_stored(self) -> int:
         return sum(batch.num_transitions for batch in self._batches)
 
+    def rng_state(self) -> dict:
+        return self._rng.bit_generator.state
+
+    def load_rng_state(self, state: dict) -> None:
+        self._rng.bit_generator.state = state
+
     def add_rollout(self, batch: EpisodeBatch) -> None:
         """Adds a complete ``NUM_ENVS``-episode rollout and evicts the oldest."""
         self._append(self._validate_and_copy(batch))

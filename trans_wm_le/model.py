@@ -81,19 +81,32 @@ class LatentEncoder(nn.Module):
 
 
 class LatentDynamics(nn.Module):
-    """Predicts the next latent state from the current latent and action."""
+    """Predicts the next latent state from [latent, action] tokens."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
         self.latent_dim = config.latent_dim
         self.action_dim = config.action_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(config.latent_dim + config.action_dim, config.model_dim),
-            nn.GELU(),
-            nn.Linear(config.model_dim, config.model_dim),
-            nn.GELU(),
+        self.position = nn.Parameter(torch.empty(1, 2, config.model_dim))
+        self.z_projection = nn.Linear(config.latent_dim, config.model_dim)
+        self.action_projection = nn.Linear(config.action_dim, config.model_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=config.model_dim,
+            nhead=config.num_heads,
+            dim_feedforward=config.feedforward_dim,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            layer, config.num_layers, enable_nested_tensor=False
+        )
+        self.output = nn.Sequential(
+            nn.LayerNorm(config.model_dim),
             nn.Linear(config.model_dim, config.latent_dim),
         )
+        nn.init.normal_(self.position, std=0.02)
 
     def forward(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         batch = latent.shape[0]
@@ -103,7 +116,15 @@ class LatentDynamics(nn.Module):
             raise ValueError(f"action must have shape [batch, {self.action_dim}].")
         if action.device != latent.device:
             raise ValueError("latent and action must be on the same device.")
-        return self.mlp(torch.cat((latent, action), dim=-1))
+        tokens = torch.cat(
+            (
+                self.z_projection(latent)[:, None],
+                self.action_projection(action)[:, None],
+            ),
+            dim=1,
+        )
+        encoded = self.transformer(tokens + self.position)
+        return self.output(encoded[:, 0])
 
 
 @dataclass(frozen=True)
@@ -113,18 +134,33 @@ class HeadOutput:
 
 
 class WorldHeads(nn.Module):
-    """Predicts reward and state value directly from one latent state."""
+    """Predicts reward from (latent, action) and value from latent."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
         self.latent_dim = config.latent_dim
-        self.reward_head = _scalar_head(config)
+        self.action_dim = config.action_dim
+        self.reward_head = _scalar_head(config, config.latent_dim + config.action_dim)
         self.value_head = _scalar_head(config)
 
-    def forward(self, latent: torch.Tensor) -> HeadOutput:
+    def forward(self, latent: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         if latent.ndim != 2 or latent.shape[1] != self.latent_dim:
             raise ValueError(f"latent must have shape [batch, {self.latent_dim}].")
-        return HeadOutput(self.reward_head(latent), self.value_head(latent))
+        action = action.flatten(start_dim=1)
+        if action.shape != (latent.shape[0], self.action_dim):
+            raise ValueError(f"action must have shape [batch, {self.action_dim}].")
+        return HeadOutput(
+            self.reward_head(torch.cat((latent, action), dim=-1)),
+            self.value_head(latent),
+        )
+
+    def reward(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        action = action.flatten(start_dim=1)
+        if latent.ndim != 2 or latent.shape[1] != self.latent_dim:
+            raise ValueError(f"latent must have shape [batch, {self.latent_dim}].")
+        if action.shape != (latent.shape[0], self.action_dim):
+            raise ValueError(f"action must have shape [batch, {self.action_dim}].")
+        return self.reward_head(torch.cat((latent, action), dim=-1))
 
 
 @dataclass(frozen=True)
@@ -146,7 +182,7 @@ class RolloutOutput:
 
 
 class WorldModel(nn.Module):
-    """Observation encoder, 64D latent encoder, MLP dynamics, and task heads."""
+    """Observation encoder, 64D latent encoder, Transformer dynamics, and task heads."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
@@ -261,16 +297,16 @@ class WorldModel(nn.Module):
     def predict_next_ema(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         return self.ema_dynamics(z, action.flatten(start_dim=1))
 
-    def predict_heads_online(self, z: torch.Tensor) -> HeadOutput:
-        return self.heads(z)
+    def predict_heads_online(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
+        return self.heads(z, action)
 
     @torch.no_grad()
-    def predict_heads(self, z: torch.Tensor) -> HeadOutput:
-        return self.ema_heads(z)
+    def predict_heads(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
+        return self.ema_heads(z, action)
 
     def evaluate_action_online(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_online(z, action)
-        heads = self.predict_heads_online(next_z)
+        heads = HeadOutput(self.heads.reward(z, action), self.heads.value_head(next_z))
         return ActionEvaluation(next_z, heads, heads.reward + self.config.gamma * heads.value)
 
     @torch.no_grad()
@@ -280,7 +316,9 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     def evaluate_action_ema(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_ema(z, action)
-        heads = self.ema_heads(next_z)
+        heads = HeadOutput(
+            self.ema_heads.reward(z, action), self.ema_heads.value_head(next_z)
+        )
         return ActionEvaluation(next_z, heads, heads.reward + self.config.gamma * heads.value)
 
     @torch.no_grad()
@@ -373,10 +411,11 @@ class WorldModel(nn.Module):
         )
 
 
-def _scalar_head(config: WorldModelConfig) -> nn.Sequential:
+def _scalar_head(config: WorldModelConfig, input_dim: int | None = None) -> nn.Sequential:
+    input_dim = config.latent_dim if input_dim is None else input_dim
     return nn.Sequential(
-        nn.LayerNorm(config.latent_dim),
-        nn.Linear(config.latent_dim, config.model_dim),
+        nn.LayerNorm(input_dim),
+        nn.Linear(input_dim, config.model_dim),
         nn.GELU(),
         nn.Linear(config.model_dim, 1),
     )

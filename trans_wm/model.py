@@ -174,15 +174,16 @@ class HeadOutput:
 
 
 class WorldHeads(nn.Module):
-    """Predicts stacked image history, current reward, and full state value from z."""
+    """Predicts next observations/value from z and reward from (z, action)."""
 
     def __init__(self, config: WorldModelConfig, encoded_shape: tuple[int, ...]) -> None:
         super().__init__()
         self.latent_dim = config.latent_dim
+        self.action_dim = config.action_dim
         self.observation_head = ImageHistoryDecoder(config, encoded_shape)
         self.reward_head = nn.Sequential(
-            nn.LayerNorm(config.latent_dim),
-            nn.Linear(config.latent_dim, config.model_dim),
+            nn.LayerNorm(config.latent_dim + config.action_dim),
+            nn.Linear(config.latent_dim + config.action_dim, config.model_dim),
             nn.GELU(),
             nn.Linear(config.model_dim, 1),
         )
@@ -193,14 +194,25 @@ class WorldHeads(nn.Module):
             nn.Linear(config.model_dim, 1),
         )
 
-    def forward(self, z: torch.Tensor) -> HeadOutput:
+    def forward(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         if z.ndim != 2 or z.shape[1] != self.latent_dim:
             raise ValueError(f"z must have shape [batch, {self.latent_dim}].")
+        action = action.flatten(start_dim=1)
+        if action.shape != (z.shape[0], self.action_dim):
+            raise ValueError(f"action must have shape [batch, {self.action_dim}].")
         return HeadOutput(
             self.observation_head(z),
-            self.reward_head(z),
+            self.reward_head(torch.cat((z, action), dim=-1)),
             self.value_head(z),
         )
+
+    def reward(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        action = action.flatten(start_dim=1)
+        if z.ndim != 2 or z.shape[1] != self.latent_dim:
+            raise ValueError(f"z must have shape [batch, {self.latent_dim}].")
+        if action.shape != (z.shape[0], self.action_dim):
+            raise ValueError(f"action must have shape [batch, {self.action_dim}].")
+        return self.reward_head(torch.cat((z, action), dim=-1))
 
 
 @dataclass(frozen=True)
@@ -310,13 +322,13 @@ class WorldModel(nn.Module):
         """Default policy-facing dynamics prediction backed by EMA."""
         return self.predict_next_ema(z, action_history, action, action_valid_mask)
 
-    def predict_heads_online(self, z: torch.Tensor) -> HeadOutput:
-        return self.heads(z)
+    def predict_heads_online(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
+        return self.heads(z, action)
 
     @torch.no_grad()
-    def predict_heads(self, z: torch.Tensor) -> HeadOutput:
+    def predict_heads(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         """Default policy-facing heads backed by EMA."""
-        return self.predict_heads_ema(z)
+        return self.predict_heads_ema(z, action)
 
     @torch.no_grad()
     def encode_ema(
@@ -343,9 +355,9 @@ class WorldModel(nn.Module):
         return self.ema_dynamics(z, ah, action.flatten(start_dim=1))
 
     @torch.no_grad()
-    def predict_heads_ema(self, z: torch.Tensor) -> HeadOutput:
+    def predict_heads_ema(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         """Policy-facing EMA observation, reward, and value heads."""
-        return self.ema_heads(z)
+        return self.ema_heads(z, action)
 
     def evaluate_action_online(
         self,
@@ -355,7 +367,11 @@ class WorldModel(nn.Module):
         action_valid_mask: torch.Tensor | None = None,
     ) -> ActionEvaluation:
         next_z = self.predict_next_online(z, action_history, action, action_valid_mask)
-        heads = self.predict_heads_online(next_z)
+        heads = HeadOutput(
+            self.heads.observation_head(next_z),
+            self.heads.reward(z, action),
+            self.heads.value_head(next_z),
+        )
         score = heads.reward + self.config.gamma * heads.value
         return ActionEvaluation(next_z, heads, score)
 
@@ -380,7 +396,11 @@ class WorldModel(nn.Module):
     ) -> ActionEvaluation:
         """Scores an action using only frozen EMA modules."""
         next_z = self.predict_next_ema(z, action_history, action, action_valid_mask)
-        heads = self.predict_heads_ema(next_z)
+        heads = HeadOutput(
+            self.ema_heads.observation_head(next_z),
+            self.ema_heads.reward(z, action),
+            self.ema_heads.value_head(next_z),
+        )
         score = heads.reward + self.config.gamma * heads.value
         return ActionEvaluation(next_z, heads, score)
 

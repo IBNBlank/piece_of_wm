@@ -15,6 +15,7 @@ from trans_wm_le import (
     WorldModelConfig,
     WorldModelTrainer,
     append_history,
+    discounted_returns,
     sample_transition_batch,
     sigreg_loss,
     tensor_episode_batch,
@@ -30,7 +31,11 @@ def _config() -> WorldModelConfig:
         action_shape=(2,),
         observation_dim=12,
         model_dim=16,
+        num_layers=1,
+        num_heads=4,
+        feedforward_dim=32,
         cnn_channels=(8, 16),
+        dropout=0.0,
     )
 
 
@@ -80,18 +85,24 @@ class WorldModelShapeTest(unittest.TestCase):
             torch.equal(latent, self.model.encode(images, obs_mask, changed, action_mask))
         )
 
-    def test_dynamics_is_mlp_of_latent_and_current_action(self) -> None:
+    def test_dynamics_uses_latent_and_current_action_tokens(self) -> None:
         latent = torch.randn(4, 64)
         action = torch.randn(4, 2)
+        captured: list[torch.Size] = []
 
-        next_latent = self.model.predict_next_online(latent, action)
+        handle = self.model.dynamics.transformer.register_forward_pre_hook(
+            lambda _module, inputs: captured.append(inputs[0].shape)
+        )
+        try:
+            next_latent = self.model.predict_next_online(latent, action)
+        finally:
+            handle.remove()
 
         self.assertEqual(next_latent.shape, (4, 64))
-        self.assertEqual(self.model.dynamics.mlp[0].in_features, 66)
-        self.assertFalse(hasattr(self.model.dynamics, "transformer"))
+        self.assertEqual(captured, [torch.Size((4, 2, 16))])
 
     def test_decoder_and_observation_head_are_absent(self) -> None:
-        heads = self.model.predict_heads(torch.randn(3, 64))
+        heads = self.model.predict_heads(torch.randn(3, 64), torch.randn(3, 2))
 
         self.assertEqual(heads.reward.shape, (3, 1))
         self.assertEqual(heads.value.shape, (3, 1))
@@ -114,6 +125,29 @@ class WorldModelShapeTest(unittest.TestCase):
 
 
 class WorldModelTrainingTest(unittest.TestCase):
+    def test_discounted_returns_are_aligned_with_current_state(self) -> None:
+        returns = discounted_returns(torch.tensor([1.0, 2.0, 3.0]), gamma=0.5)
+        torch.testing.assert_close(returns, torch.tensor([2.75, 3.5, 3.0]))
+
+    def test_replay_update_does_not_train_value_head(self) -> None:
+        model = WorldModel(_config())
+        trainer = WorldModelTrainer(model, _training_config())
+        before = [parameter.detach().clone() for parameter in model.heads.value_head.parameters()]
+        trainer.train_transitions(_batch(), batch_size=3, rng=np.random.default_rng(1))
+        for previous, current in zip(before, model.heads.value_head.parameters(), strict=True):
+            torch.testing.assert_close(previous, current, rtol=0.0, atol=0.0)
+
+    def test_reward_is_conditioned_on_current_latent_and_action(self) -> None:
+        model = WorldModel(_config())
+        z = torch.randn(2, model.config.latent_dim)
+        low = model.heads.reward(z, -torch.ones(2, model.config.action_dim))
+        high = model.heads.reward(z, torch.ones(2, model.config.action_dim))
+        self.assertFalse(torch.equal(low, high))
+        self.assertEqual(
+            model.heads.reward_head[1].in_features,
+            model.config.latent_dim + model.config.action_dim,
+        )
+
     def test_transition_sampler_preserves_frame_history_alignment(self) -> None:
         sampled = sample_transition_batch(
             _batch(), WorldModel(_config()), batch_size=6, rng=np.random.default_rng(4)
@@ -169,7 +203,7 @@ class WorldModelTrainingTest(unittest.TestCase):
 
         self.assertIsNotNone(model.encoder.to_observation[1].weight.grad)
         self.assertIsNotNone(model.latent_encoder.mlp[0].weight.grad)
-        self.assertIsNotNone(model.dynamics.mlp[-1].weight.grad)
+        self.assertIsNotNone(model.dynamics.output[-1].weight.grad)
         model.zero_grad(set_to_none=True)
         trainer = WorldModelTrainer(model, config)
         full_metrics = trainer.train_batch(batch)
