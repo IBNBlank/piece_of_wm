@@ -202,7 +202,7 @@ actions:    [PAD PAD PAD PAD PAD PAD PAD a0 a1]
 action mask:[ 0   0   0   0   0   0   0  1  1]
 ```
 
-训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。Value 使用完整在线 episode 的 Monte Carlo return，不执行 terminal bootstrap。
+训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。Value 使用真实 reward 与 EMA world-model bootstrap 构造 TD(lambda) return；真正 `terminated` 时 bootstrap 为零，时间截断时保留 bootstrap。
 
 ## 训练时间对齐
 
@@ -217,7 +217,7 @@ action mask:[ 0   0   0   0   0   0   0  1  1]
 Dynamics(z_t, ah_t, a_t) -> z_hat_{t+1}
 ObservationHead(z_t)      -> 10-frame history ending at o_t
 RewardHead(z_{t+1})       -> r_t
-ValueHead(z_t)            -> V_t
+min_k ValueHead_k(z_t)    -> V_t
 ```
 
 ## 损失函数
@@ -256,14 +256,14 @@ L_vae_kl = -0.5 * mean(1 + log_variance - mean^2 - exp(log_variance))
 
 ### Value 损失
 
-Value 不使用 replay transition 的 Bellman target。每个训练单元执行当前粒子策略的真实在线 episode，并计算 Monte Carlo return-to-go：
+Value 不使用 replay transition 的 Bellman target。每个训练单元执行当前粒子策略的真实在线 episode，并用 EMA world model 的一步预测和最差 EMA critic 计算 TD(lambda) target：
 
 ```text
-G_t = r_t + gamma * G_{t+1}
-L_value(t) = (V_hat(sg(z_t)) - G_t)^2
+G_t^lambda = r_t + gamma * ((1 - lambda) * V^-_EMA(z_hat_{t+1}) + lambda * G_{t+1}^lambda)
+L_value(t) = (min_k V_k(sg(z_t)) - G_t^lambda)^2
 ```
 
-在线 rollout 使用冻结的 EMA encoder 产生 `z_t`，value 更新只修改在线 Value Head。Replay optimizer 明确排除 Value Head。
+在线 rollout 使用冻结的 EMA encoder、dynamics 和 critic ensemble。lambda bootstrap 和 critic 更新使用最小 critic，planning 使用 critic 均值。Replay optimizer 明确排除 critics。
 
 EMA 参数在每次训练更新后更新，覆盖 Encoder、Dynamics 和全部 Heads：
 

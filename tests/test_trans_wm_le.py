@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
+
+import trans_wm_le.training as training_module
 
 from trans_wm_le import (
     ACTION_HISTORY_LEN,
@@ -125,6 +128,51 @@ class WorldModelShapeTest(unittest.TestCase):
 
 
 class WorldModelTrainingTest(unittest.TestCase):
+    def test_validation_epoch_visits_every_transition_once(self) -> None:
+        trainer = WorldModelTrainer(WorldModel(_config()), _training_config())
+        batch = _batch()
+        with mock.patch.object(
+            training_module,
+            "transition_batch_from_indices",
+            wraps=training_module.transition_batch_from_indices,
+        ) as build_batch:
+            metrics = trainer.evaluate_transitions(
+                batch, batch_size=4, rng=np.random.default_rng(7)
+            )
+
+        visited = np.concatenate([call.args[2] for call in build_batch.call_args_list])
+        np.testing.assert_array_equal(np.sort(visited), np.arange(batch.num_transitions))
+        self.assertEqual(build_batch.call_count, 2)
+        self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
+
+    def test_epoch_visits_every_transition_once_and_keeps_partial_batch(self) -> None:
+        trainer = WorldModelTrainer(WorldModel(_config()), _training_config())
+        batches = [_batch(), _batch()]
+        on_update = mock.Mock()
+        with (
+            mock.patch.object(
+                training_module,
+                "transition_batch_from_indices",
+                wraps=training_module.transition_batch_from_indices,
+            ) as build_batch,
+            mock.patch.object(trainer.optimizer, "step", wraps=trainer.optimizer.step) as step,
+        ):
+            metrics = trainer.train_epoch(
+                batches,
+                batch_size=5,
+                rng=np.random.default_rng(7),
+                on_update=on_update,
+            )
+
+        for batch in batches:
+            visited = np.concatenate(
+                [call.args[2] for call in build_batch.call_args_list if call.args[0] is batch]
+            )
+            np.testing.assert_array_equal(np.sort(visited), np.arange(6))
+        self.assertEqual(step.call_count, 3)
+        self.assertEqual(on_update.call_count, 3)
+        self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
+
     def test_discounted_returns_are_aligned_with_current_state(self) -> None:
         returns = discounted_returns(torch.tensor([1.0, 2.0, 3.0]), gamma=0.5)
         torch.testing.assert_close(returns, torch.tensor([2.75, 3.5, 3.0]))

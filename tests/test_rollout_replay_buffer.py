@@ -9,7 +9,13 @@ from pathlib import Path
 
 import numpy as np
 
-from utils.replay_buffer import EpisodeBatch, METADATA_FILE, ROLLOUT_FILE_TEMPLATE, RolloutReplayBuffer
+from utils.replay_buffer import (
+    EpisodeBatch,
+    METADATA_FILE,
+    OfflineRolloutDataset,
+    ROLLOUT_FILE_TEMPLATE,
+    RolloutReplayBuffer,
+)
 
 
 def _episode_batch(value: float, lengths: tuple[int, int] = (2, 3)) -> EpisodeBatch:
@@ -43,6 +49,31 @@ def _flat_rollout() -> dict[str, np.ndarray]:
 
 
 class RolloutReplayBufferTest(unittest.TestCase):
+    def test_offline_dataset_reads_without_creating_a_replay_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            source_dir = root / "dataset"
+            source_dir.mkdir()
+            filename = ROLLOUT_FILE_TEMPLATE.format(rollout_index=0)
+            np.savez_compressed(source_dir / filename, **_flat_rollout())
+            (source_dir / METADATA_FILE).write_text(
+                json.dumps(
+                    {
+                        "format": "rollout-npz-v1",
+                        "rollout_files": [filename],
+                        "num_envs": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = OfflineRolloutDataset(source_dir, seed=4)
+
+            self.assertEqual(dataset.num_rollouts, 1)
+            self.assertEqual(dataset.num_stored, 5)
+            self.assertEqual(dataset.sample(1).num_transitions, 5)
+            self.assertEqual(sorted(path.name for path in root.iterdir()), ["dataset"])
+
     def test_imports_flat_multi_env_rollout_as_complete_episodes_in_ram(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
@@ -65,6 +96,9 @@ class RolloutReplayBufferTest(unittest.TestCase):
             np.testing.assert_array_equal(batch.obs[0, :3, 0], [1.0, 2.0, 2.5])
             np.testing.assert_array_equal(batch.obs[1, :4, 0], [10.0, 11.0, 12.0, 12.5])
             self.assertNotIsInstance(batch.obs, np.memmap)
+            stored_batches = buffer.batches
+            self.assertEqual(len(stored_batches), 1)
+            self.assertIs(stored_batches[0], buffer.batches[0])
             (buffer.storage_dir / filename).unlink()
             self.assertEqual(buffer.sample(1).num_transitions, 5)
 

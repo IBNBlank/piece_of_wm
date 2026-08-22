@@ -19,6 +19,18 @@ class ParticlePolicy:
     own reward and value models, then pass those scores to :meth:`update_particles`.
     """
 
+    def __init__(self, num_particles: int = NUM_ACTION_PARTICLES, horizon: int = 1) -> None:
+        if isinstance(num_particles, bool) or not isinstance(num_particles, int):
+            raise TypeError("num_particles must be an integer.")
+        if num_particles <= 0:
+            raise ValueError("num_particles must be positive.")
+        if isinstance(horizon, bool) or not isinstance(horizon, int):
+            raise TypeError("horizon must be an integer.")
+        if horizon <= 0:
+            raise ValueError("horizon must be positive.")
+        self.num_particles = num_particles
+        self.horizon = horizon
+
     def init_particles(
         self,
         batch_size: int,
@@ -27,13 +39,13 @@ class ParticlePolicy:
         dtype: torch.dtype = torch.float32,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """Returns uniformly sampled particles with shape ``(batch, 100, 1)``."""
+        """Returns uniformly sampled particles for each batch element."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         if not torch.empty((), dtype=dtype).is_floating_point():
             raise TypeError("Particle dtype must be floating point.")
         return PENDULUM_ACTION_LOW + (PENDULUM_ACTION_HIGH - PENDULUM_ACTION_LOW) * torch.rand(
-            (batch_size, NUM_ACTION_PARTICLES, PENDULUM_ACTION_DIM),
+            (batch_size, self.num_particles, self.horizon, PENDULUM_ACTION_DIM),
             dtype=dtype,
             device=device,
             generator=generator,
@@ -49,7 +61,7 @@ class ParticlePolicy:
     ) -> torch.Tensor:
         """Resamples particles by score and perturbs each result with Gaussian noise.
 
-        ``scores`` has shape ``(batch, 100)`` and is converted to resampling weights
+        ``scores`` has shape ``(batch, num_particles)`` and is converted to resampling weights
         with ``softmax``. ``sigma`` is the Gaussian standard deviation; omitting it
         uses ``0.1``.
         """
@@ -61,14 +73,16 @@ class ParticlePolicy:
 
         parent_indices = torch.multinomial(
             torch.softmax(scores, dim=1),
-            NUM_ACTION_PARTICLES,
+            self.num_particles,
             replacement=True,
             generator=generator,
         )
         resampled = torch.gather(
             particles,
             dim=1,
-            index=parent_indices[..., None].expand(-1, -1, PENDULUM_ACTION_DIM),
+            index=parent_indices[..., None, None].expand(
+                -1, -1, self.horizon, PENDULUM_ACTION_DIM
+            ),
         )
         if sigma == 0.0:
             return resampled
@@ -80,12 +94,18 @@ class ParticlePolicy:
         )
         return (resampled + sigma * noise).clamp(PENDULUM_ACTION_LOW, PENDULUM_ACTION_HIGH)
 
-    @staticmethod
-    def _validate_particles(particles: torch.Tensor) -> None:
+    def _validate_particles(self, particles: torch.Tensor) -> None:
         if not isinstance(particles, torch.Tensor):
             raise TypeError("particles must be a torch.Tensor.")
-        if particles.ndim != 3 or particles.shape[1:] != (NUM_ACTION_PARTICLES, PENDULUM_ACTION_DIM):
-            raise ValueError("particles must have shape (batch, 100, 1).")
+        if particles.ndim != 4 or particles.shape[1:] != (
+            self.num_particles,
+            self.horizon,
+            PENDULUM_ACTION_DIM,
+        ):
+            raise ValueError(
+                f"particles must have shape (batch, {self.num_particles}, "
+                f"{self.horizon}, 1)."
+            )
         if not torch.is_floating_point(particles):
             raise TypeError("particles must use a floating-point dtype.")
 
@@ -94,7 +114,7 @@ class ParticlePolicy:
         if not isinstance(scores, torch.Tensor):
             raise TypeError("scores must be a torch.Tensor.")
         if scores.shape != particles.shape[:2]:
-            raise ValueError("scores must have shape (batch, 100).")
+            raise ValueError("scores must have shape (batch, num_particles).")
         if scores.device != particles.device:
             raise ValueError("scores and particles must be on the same device.")
         if not torch.is_floating_point(scores):

@@ -11,6 +11,7 @@ from torch import nn
 
 from trans_wm_le.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN, WorldModelConfig
 from trans_wm_le.history import append_history
+from utils.value import EnsembleValueHead
 
 
 class ImageHistoryEncoder(nn.Module):
@@ -141,7 +142,9 @@ class WorldHeads(nn.Module):
         self.latent_dim = config.latent_dim
         self.action_dim = config.action_dim
         self.reward_head = _scalar_head(config, config.latent_dim + config.action_dim)
-        self.value_head = _scalar_head(config)
+        self.value_head = EnsembleValueHead(
+            config.latent_dim, config.model_dim, config.num_critics
+        )
 
     def forward(self, latent: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         if latent.ndim != 2 or latent.shape[1] != self.latent_dim:
@@ -306,7 +309,7 @@ class WorldModel(nn.Module):
 
     def evaluate_action_online(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_online(z, action)
-        heads = HeadOutput(self.heads.reward(z, action), self.heads.value_head(next_z))
+        heads = HeadOutput(self.heads.reward(z, action), self.heads.value_head.mean(next_z))
         return ActionEvaluation(next_z, heads, heads.reward + self.config.gamma * heads.value)
 
     @torch.no_grad()
@@ -317,7 +320,7 @@ class WorldModel(nn.Module):
     def evaluate_action_ema(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_ema(z, action)
         heads = HeadOutput(
-            self.ema_heads.reward(z, action), self.ema_heads.value_head(next_z)
+            self.ema_heads.reward(z, action), self.ema_heads.value_head.mean(next_z)
         )
         return ActionEvaluation(next_z, heads, heads.reward + self.config.gamma * heads.value)
 

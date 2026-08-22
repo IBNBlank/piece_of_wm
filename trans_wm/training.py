@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, fields
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from trans_wm.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN
 from trans_wm.history import history_windows, previous_history_windows
 from trans_wm.model import WorldModel
 from utils.replay_buffer import EpisodeBatch, RolloutReplayBuffer
+from utils.value import discounted_returns
 
 
 @dataclass(frozen=True)
@@ -115,12 +117,27 @@ def sample_transition_batch(
     """Samples transitions with their exact image and action histories."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
+    flat_indices = rng.integers(0, batch.num_transitions, size=batch_size)
+    return transition_batch_from_indices(batch, model, flat_indices)
+
+
+def transition_batch_from_indices(
+    batch: EpisodeBatch,
+    model: WorldModel,
+    flat_indices: np.ndarray,
+) -> TensorTransitionBatch:
+    """Builds an aligned transition batch from flattened episode indices."""
     source = batch.images if batch.images is not None else batch.obs
     if source.ndim != 5:
         raise ValueError("Trans-WM training requires image observations.")
+    flat_indices = np.asarray(flat_indices, dtype=np.int64)
+    if flat_indices.ndim != 1 or len(flat_indices) == 0:
+        raise ValueError("flat_indices must be a non-empty one-dimensional array.")
     lengths = np.asarray(batch.lengths, dtype=np.int64)
     cumulative = np.cumsum(lengths)
-    flat_indices = rng.integers(0, int(cumulative[-1]), size=batch_size)
+    if np.any(flat_indices < 0) or np.any(flat_indices >= cumulative[-1]):
+        raise IndexError("Transition index is outside the episode batch.")
+    batch_size = len(flat_indices)
     episode_indices = np.searchsorted(cumulative, flat_indices, side="right")
     starts = np.concatenate((np.zeros(1, dtype=np.int64), cumulative[:-1]))
     time_indices = flat_indices - starts[episode_indices]
@@ -173,6 +190,18 @@ def sample_transition_batch(
     )
 
 
+def concatenate_transition_batches(
+    batches: Sequence[TensorTransitionBatch],
+) -> TensorTransitionBatch:
+    """Concatenates transition tensors assembled from different rollout files."""
+    return TensorTransitionBatch(
+        *(
+            torch.cat([getattr(batch, field.name) for batch in batches], dim=0)
+            for field in fields(TensorTransitionBatch)
+        )
+    )
+
+
 def encode_sequence(
     model: WorldModel, batch: TensorEpisodeBatch
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -196,20 +225,6 @@ def vae_kl_loss(mean: torch.Tensor, log_variance: torch.Tensor) -> torch.Tensor:
     return -0.5 * (
         1.0 + log_variance - mean.square() - log_variance.exp()
     ).mean(dim=-1)
-
-
-def discounted_returns(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
-    """Monte Carlo return-to-go for one complete online episode."""
-    if rewards.ndim != 1 or rewards.numel() == 0:
-        raise ValueError("rewards must be a non-empty one-dimensional tensor.")
-    if not 0.0 <= gamma <= 1.0:
-        raise ValueError("gamma must be in [0, 1].")
-    returns = torch.empty_like(rewards)
-    running = rewards.new_zeros(())
-    for timestep in range(rewards.shape[0] - 1, -1, -1):
-        running = rewards[timestep] + gamma * running
-        returns[timestep] = running
-    return returns
 
 
 def world_model_loss(
@@ -374,22 +389,87 @@ class WorldModelTrainer:
         self.model.update_target()
         return losses.detached()
 
+    def train_epoch(
+        self,
+        batches: Sequence[EpisodeBatch],
+        batch_size: int,
+        rng: np.random.Generator,
+        on_update: Callable[[dict[str, float]], None] | None = None,
+    ) -> dict[str, float]:
+        """Trains once on every valid transition, in shuffled minibatches."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if not batches:
+            raise ValueError("An epoch requires at least one rollout batch.")
+        totals: dict[str, float] = {}
+        num_transitions = 0
+        cumulative = np.cumsum([batch.num_transitions for batch in batches])
+        indices = rng.permutation(int(cumulative[-1]))
+        starts = np.concatenate((np.zeros(1, dtype=np.int64), cumulative[:-1]))
+        for start in range(0, len(indices), batch_size):
+            minibatch_indices = indices[start : start + batch_size]
+            batch_indices = np.searchsorted(cumulative, minibatch_indices, side="right")
+            parts = [
+                transition_batch_from_indices(
+                    batches[int(batch_index)],
+                    self.model,
+                    minibatch_indices[batch_indices == batch_index] - starts[batch_index],
+                )
+                for batch_index in np.unique(batch_indices)
+            ]
+            self.model.train()
+            sampled = parts[0] if len(parts) == 1 else concatenate_transition_batches(parts)
+            self.optimizer.zero_grad(set_to_none=True)
+            losses = transition_world_model_loss(self.model, sampled, self.config)
+            losses.total.backward()
+            if self.config.grad_clip_norm is not None:
+                nn.utils.clip_grad_norm_(
+                    (parameter for parameter in self.model.parameters() if parameter.requires_grad),
+                    self.config.grad_clip_norm,
+                )
+            self.optimizer.step()
+            self.model.update_target()
+            metrics = losses.detached()
+            if on_update is not None:
+                on_update(metrics)
+            count = len(minibatch_indices)
+            num_transitions += count
+            for name, value in metrics.items():
+                totals[name] = totals.get(name, 0.0) + value * count
+        return {name: value / num_transitions for name, value in totals.items()}
+
     def evaluate_transitions(
         self,
         batch: EpisodeBatch,
         batch_size: int,
         rng: np.random.Generator,
     ) -> dict[str, float]:
-        """Evaluates a sampled transition batch without updating model state."""
+        """Evaluates every valid transition once, in shuffled minibatches."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
         self.model.eval()
-        sampled = sample_transition_batch(batch, self.model, batch_size, rng)
+        totals: dict[str, float] = {}
+        num_transitions = 0
+        indices = rng.permutation(batch.num_transitions)
         with torch.inference_mode():
-            return transition_world_model_loss(self.model, sampled, self.config).detached()
+            for start in range(0, len(indices), batch_size):
+                minibatch_indices = indices[start : start + batch_size]
+                sampled = transition_batch_from_indices(
+                    batch, self.model, minibatch_indices
+                )
+                metrics = transition_world_model_loss(
+                    self.model, sampled, self.config
+                ).detached()
+                count = len(minibatch_indices)
+                num_transitions += count
+                for name, value in metrics.items():
+                    totals[name] = totals.get(name, 0.0) + value * count
+        return {name: value / num_transitions for name, value in totals.items()}
 
     def train_value_rollout(
         self, latents: torch.Tensor, returns: torch.Tensor
     ) -> dict[str, float]:
-        """Fits V(z_t) to return-to-go from the current policy's real rollout."""
+        """Fits every online critic to aligned value targets from a real rollout."""
         if latents.ndim != 2 or latents.shape[1] != self.model.config.latent_dim:
             raise ValueError("latents must have shape [time, latent_dim].")
         returns = returns.reshape(-1, 1)
@@ -397,7 +477,7 @@ class WorldModelTrainer:
             raise ValueError("latents and returns must have the same time dimension.")
         self.model.train()
         self.value_optimizer.zero_grad(set_to_none=True)
-        prediction = self.model.heads.value_head(latents.detach())
+        prediction = self.model.heads.value_head.minimum(latents.detach())
         loss = (prediction - returns.detach()).square().mean()
         (self.config.value_weight * loss).backward()
         if self.config.grad_clip_norm is not None:

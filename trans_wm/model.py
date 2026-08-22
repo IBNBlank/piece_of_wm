@@ -12,6 +12,7 @@ from torch.nn import functional as F
 
 from trans_wm.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN, WorldModelConfig
 from trans_wm.history import append_history
+from utils.value import EnsembleValueHead
 
 
 @dataclass(frozen=True)
@@ -187,11 +188,8 @@ class WorldHeads(nn.Module):
             nn.GELU(),
             nn.Linear(config.model_dim, 1),
         )
-        self.value_head = nn.Sequential(
-            nn.LayerNorm(config.latent_dim),
-            nn.Linear(config.latent_dim, config.model_dim),
-            nn.GELU(),
-            nn.Linear(config.model_dim, 1),
+        self.value_head = EnsembleValueHead(
+            config.latent_dim, config.model_dim, config.num_critics
         )
 
     def forward(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
@@ -370,7 +368,7 @@ class WorldModel(nn.Module):
         heads = HeadOutput(
             self.heads.observation_head(next_z),
             self.heads.reward(z, action),
-            self.heads.value_head(next_z),
+            self.heads.value_head.mean(next_z),
         )
         score = heads.reward + self.config.gamma * heads.value
         return ActionEvaluation(next_z, heads, score)
@@ -399,7 +397,7 @@ class WorldModel(nn.Module):
         heads = HeadOutput(
             self.ema_heads.observation_head(next_z),
             self.ema_heads.reward(z, action),
-            self.ema_heads.value_head(next_z),
+            self.ema_heads.value_head.mean(next_z),
         )
         score = heads.reward + self.config.gamma * heads.value
         return ActionEvaluation(next_z, heads, score)

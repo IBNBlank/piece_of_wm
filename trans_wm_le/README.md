@@ -196,12 +196,12 @@ r_hat_t: [B, 1]
 
 因此 `r_hat_t` 表示执行 `a_t` 所对应的 transition reward，而不是进入 `z_t` 之前的 reward。
 
-### Value Head
+### Critic Ensemble
 
-Value Head 输出完整状态 Value：
+多个独立 critic 输出完整状态 Value；所有规划和 rollout 调用取最差值：
 
 ```text
-value_hat = ValueHead(z)
+value_hat = min_k ValueHead_k(z)
 value_hat: [B, 1]
 ```
 
@@ -214,7 +214,7 @@ z_hat_{t+1} = Dynamics(z_t, a_t)
 
 score(z_t, a_t)
     = RewardHead(z_t, a_t)
-    + gamma * ValueHead(z_hat_{t+1})
+    + gamma * min_k ValueHead_k(z_hat_{t+1})
 ```
 
 这个 score 是基于 action-conditioned next latent 的 Q-style 估计。world model 只返回 score，不负责比较、搜索或选择 action。
@@ -233,7 +233,7 @@ action mask: [ 0   0   0   0   0   0   0  1  1]
 
 mask 在进入 CNN 或 Latent Encoder 前显式清零 padding 值。训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition，并使用 `state_valid` 排除 SIGReg 中的无效状态。
 
-Value 使用完整在线 episode 的 Monte Carlo return，不执行 terminal bootstrap。
+Value 使用真实 reward 与 EMA world-model bootstrap 构造 TD(lambda) return；真正 `terminated` 时 bootstrap 为零，时间截断时保留 bootstrap。
 
 ## 训练时间对齐
 
@@ -254,7 +254,7 @@ concat(obs_tensor_{t+1}, ah_{t+1})
                                   -> z_target_{t+1}
 
 RewardHead(z_t, a_t)             -> r_hat_t
-ValueHead(z_hat_{t+1})           -> predicted next value
+min_k ValueHead_k(z_hat_{t+1})   -> predicted next value
 ```
 
 也就是：
@@ -357,14 +357,14 @@ Reward loss 更新 Encoder 和 Reward Head；Dynamics 由 JEPA loss 更新。
 
 ### Value Loss
 
-Value 不从 replay buffer 更新。每个训练单元用当前粒子策略执行真实在线 episode，并计算 return-to-go：
+Value 不从 replay buffer 更新。每个训练单元用当前粒子策略执行真实在线 episode，并用 EMA world model 的一步预测和最差 EMA critic 计算 TD(lambda) target：
 
 ```text
-G_t = r_t + gamma * G_{t+1}
-L_value(t) = (ValueHead(stop_gradient(z_t)) - G_t)^2
+G_t^lambda = r_t + gamma * ((1 - lambda) * V^-_EMA(z_hat_{t+1}) + lambda * G_{t+1}^lambda)
+L_value(t) = (min_k V_k(stop_gradient(z_t)) - G_t^lambda)^2
 ```
 
-在线 latent 来自冻结的 EMA encoder，value optimizer 只更新 Value Head；replay optimizer 明确排除 Value Head。
+在线 latent 和 bootstrap 来自冻结的 EMA world model。lambda bootstrap 和 critic 更新使用最小 critic，planning 使用 critic 均值；replay optimizer 明确排除 critics。
 
 ### 总损失
 
@@ -477,7 +477,14 @@ rollout = model.rollout(
 
 ## 命令行训练
 
-推荐使用仓库根目录下的运行脚本。所有常用训练与模型参数都可以通过环境变量覆盖：
+推荐使用仓库根目录下的运行脚本。网络结构使用 `WorldModelConfig` 中的固定配置：observation dim 128、Transformer model dim 256、3 层、4 个 attention heads、FFN dim 512、CNN channels `(32, 64, 128)`、dropout 0。critic 数量通过预训练脚本的 `NUM_CRITICS` 配置（默认 2），正式训练从预训练 checkpoint 读取该数量及其余模型配置。训练参数可以通过环境变量覆盖：
+
+依次执行预训练和正式训练：
+
+```bash
+DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 NUM_CRITICS=5 \
+./run_integrate_trans_wm_le.sh
+```
 
 ```bash
 ./run_train_trans_wm_le.sh
@@ -496,8 +503,6 @@ SIGREG_WEIGHT=0.1 \
 python -m trans_wm_le.train \
     --data-dir dataset \
     --output-dir runs/trans_wm_le \
-    --observation-dim 128 \
-    --model-dim 256 \
     --jepa-weight 1.0 \
     --sigreg-weight 1.0
 ```

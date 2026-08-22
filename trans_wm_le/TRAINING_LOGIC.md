@@ -28,7 +28,7 @@ flowchart TD
     EMA1 --> ONLINE_EPISODE
 
     subgraph ValueUpdate[Online value update: value_rollouts episodes]
-        ONLINE_EPISODE["Real environment episode<br/>EMA model + particle action search"] --> RETURNS["Actual rewards -> Monte Carlo returns G_t"]
+        ONLINE_EPISODE["Real environment episode<br/>EMA model + particle action search"] --> RETURNS["Actual rewards + EMA WM bootstrap<br/>-> lambda returns G_t"]
         ONLINE_EPISODE --> STATES["Collected EMA latents z_t"]
         STATES --> VALUE_LOSS["MSE: V_online(stopgrad(z_t)) vs G_t"]
         RETURNS --> VALUE_LOSS
@@ -36,10 +36,16 @@ flowchart TD
     end
 
     VALUE_OPT --> EMA2["EMA update of all target modules"]
-    EMA2 --> CHECK["Periodic validation, checkpoints,<br/>and early-stop decision"]
+    EMA2 --> CHECK["Periodic validation and checkpoints"]
 ```
 
 一次外层训练单元（CLI 的 `rollout`）顺序为：先进行多次 replay transition 更新，再执行若干当前策略的真实环境 episode 来训练 value head。它不在 replay 数据上训练 value。
+
+## 预训练阶段
+
+`run_pretrain_trans_wm_le.sh` 通过 `--pretrain` 进入纯 world-model 阶段。该阶段直接从 `DATA_DIR` 将源 rollout 加载到 RAM，不会在输出目录复制 replay 文件；随后按 epoch 打乱全部离线 transition，并以无放回 minibatch 完整遍历一次数据。它不会创建 Gym 环境、执行 particle policy 或调用 `train_value_rollout`，因此 ensemble critic 不会在 encoder、dynamics 和 reward head 尚未收敛时被训练。
+
+预训练使用固定 validation batch 的 `total` loss 选择 `checkpoint_best.pt`，并保留最近两个带 epoch 编号的 checkpoint。`RESUME` 用于恢复同一预训练阶段的完整 optimizer、epoch 计数器和 RNG 状态；正式训练则通过 `PRETRAINED_CHECKPOINT` 加载预训练模型和 world optimizer，并重新初始化正式 rollout 计数、critic optimizer、best return 和 RNG 状态。预训练 checkpoint 与正式训练 checkpoint 分别标记为 `phase=pretrain` 和 `phase=training`，不能混用 `RESUME`。
 
 ## 模型与参数副本
 
@@ -119,21 +125,24 @@ flowchart LR
     SCORE --> ACT["Best sampled action"]
     ACT --> ENV["Real environment step"]
     ENV --> R["Actual reward r_t"]
-    R --> G["Backward return-to-go<br/>G_t = r_t + gamma G_t+1"]
-    Z --> V["Online ValueHead(stopgrad(z_t))"]
+    R --> G["Backward lambda-return"]
+    Z --> WM["EMA dynamics -> z_hat_t+1"]
+    WM --> BOOT["min EMA critics -> V^-_t+1"]
+    BOOT --> G
+    Z --> V["Online critic ensemble(stopgrad(z_t))"]
     G --> LOSS["Value MSE"]
     V --> LOSS
-    LOSS --> OPT["value_optimizer: ValueHead only"]
+    LOSS --> OPT["value_optimizer: all online critics"]
 ```
 
-动作搜索本身处于 `inference_mode`，使用 EMA encoder、EMA dynamics、EMA reward head 和 EMA value head 评分候选 action。真实 episode 保存的是执行动作前的 EMA latent `z_t` 及环境给出的实际 rewards。之后：
+动作搜索本身处于 `inference_mode`，使用 EMA encoder、EMA dynamics、EMA reward head 和 EMA critic ensemble 评分候选 action；planning 使用 critic 均值。真实 episode 保存执行动作前的 EMA latent `z_t`、环境实际 reward，以及 EMA dynamics 对执行动作预测的下一 latent 对应的最差 EMA Value。真正 `terminated` 时 bootstrap 为零，时间截断时保留 bootstrap。critic 更新和 lambda bootstrap 都使用 ensemble 最小值。之后：
 
 ```text
-G_t = r_t + 0.95 * G_{t+1}
-L_value = mean((V_online(stopgrad(z_t)) - stopgrad(G_t))^2)
+G_t^lambda = r_t + gamma * ((1 - lambda) * V^-_EMA(z_hat_{t+1}) + lambda * G_{t+1}^lambda)
+L_value = (min_k V_online_k(stopgrad(z_t)) - stopgrad(G_t^lambda))^2
 ```
 
-`value_optimizer` 只更新在线 `model.heads.value_head`。对 latent 和 return 都 `detach`，所以 value 训练不会反向更新 encoder 或 dynamics；更新后同样执行一次完整 EMA 更新。
+`value_optimizer` 对 ensemble minimum 反向传播，因此每个样本更新当前给出最小值的在线 critic。对 latent、bootstrap 和 return 都 `detach`，所以 value 训练不会反向更新 encoder 或 dynamics；更新后同样执行一次完整 EMA 更新。
 
 ## 外层训练循环
 
@@ -148,24 +157,28 @@ repeat epochs_per_rollout times:
 
 repeat value_rollouts times:
     online = run_real_episode_with_particle_policy(...)
-    targets = discounted_returns(online.rewards, gamma=0.95)
+    targets = lambda_returns(
+        online.rewards,
+        online.bootstrap_values,
+        model.config.gamma,
+        lambda_return,
+    )
     repeat value_epochs times:
         train_value_rollout(online.latents, targets)
 ```
 
-`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机 transition 更新。在线 episode 的策略不是被梯度直接训练的 actor：它只是用粒子搜索当前 world model 给候选 action 打分。
+`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机 transition 更新。在线 episode 的策略不是被梯度直接训练的 actor：它只是用粒子搜索当前 world model 给候选 action 打分。`NUM_PARTICLES`、`PLANNING_HORIZON` 和 `LAMBDA_RETURN` 都可从训练 shell 配置。
 
-## 验证、Checkpoint 与 Early Stopping
+## 验证与 Checkpoint
 
 训练开始时会从 replay buffer 固定抽取一个 `validation_batch`。默认每 10 个外层单元（以及最后一次）会：
 
-1. 用固定 seed 从这份 validation batch 构造同一批 transition，并在 `inference_mode` 下计算 replay 损失。
+1. 用固定 seed 将 validation batch 的全部有效 transition 无放回遍历一遍，并在 `inference_mode` 下按 minibatch 计算、加权汇总 replay 损失。
 2. 在真实环境独立运行 10 个评估 episode，计算平均 `evaluation_return`；这些 episode 不用于 value 训练。
-3. 保存带 rollout 编号的 checkpoint，只保留最近两份。checkpoint 包含 online 与 EMA 参数、两个 optimizer 状态、模型/训练配置、best/early-stop 状态，以及 replay、策略、评估、CPU 和 CUDA 随机数状态。
-4. 若 `evaluation_return` 严格优于历史最佳值，额外保存 `checkpoint_best.pt` 并清零计数器。
-5. 否则递增 `checks_without_improvement`；达到 `early_stop_patience` 时结束训练。
+3. 保存带 rollout 编号的 checkpoint，只保留最近两份。checkpoint 包含 online 与 EMA 参数、两个 optimizer 状态、模型/训练配置、best 状态，以及 replay、策略、评估、CPU 和 CUDA 随机数状态。
+4. 若 `evaluation_return` 严格优于历史最佳值，额外保存 `checkpoint_best.pt`。
 
-因此 validation loss 被记录用于观察 replay 表现，而 best checkpoint 与 early stopping 的选择指标是独立评估的平均 `evaluation_return`，不是用于 value 更新的 episode 回报，也不是 validation total loss。`--resume` 可指定具体 checkpoint 或运行目录；目录模式自动选择编号最大的 checkpoint。
+因此 validation loss 被记录用于观察 replay 表现，而 best checkpoint 的选择指标是独立评估的平均 `evaluation_return`，不是用于 value 更新的 episode 回报，也不是 validation total loss。评估结果不会缩短训练，online 阶段始终执行到指定的 `rollouts`。`--resume` 可指定具体 checkpoint 或运行目录；目录模式自动选择编号最大的 checkpoint。
 
 ## 参数更新归属
 

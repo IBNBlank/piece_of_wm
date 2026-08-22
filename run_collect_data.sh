@@ -39,7 +39,7 @@ fi
 ENV_ID="${ENV_ID:-Pendulum-v1}"
 ROLLOUTS="${ROLLOUTS:-20}"
 MAX_STEPS="${MAX_STEPS:-200}"
-NUM_ENVS="${NUM_ENVS:-10}"
+NUM_ENVS="${NUM_ENVS:-20}"
 SEED="${SEED:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-dataset/pendulum-random}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"

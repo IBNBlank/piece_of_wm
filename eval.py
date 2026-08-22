@@ -29,14 +29,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=("all", "trans_wm", "trans_wm_le"), default="all")
     parser.add_argument("--env-id", default="Pendulum-v1")
-    parser.add_argument("--trans-wm-checkpoint", type=Path, default=Path("runs/trans_wm/checkpoint.pt"))
+    parser.add_argument(
+        "--trans-wm-checkpoint",
+        type=Path,
+        default=Path("runs/trans_wm/checkpoint_best.pt"),
+    )
     parser.add_argument(
         "--trans-wm-le-checkpoint",
         type=Path,
-        default=Path("runs/trans_wm_le/checkpoint.pt"),
+        default=Path("runs/trans_wm_le/checkpoint_best.pt"),
     )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument("--num-particles", type=int, default=100)
     parser.add_argument("--particle-updates", type=int, default=4)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--planning-horizon", type=int, default=1)
@@ -54,11 +59,14 @@ def main() -> None:
     if min(
         args.episodes,
         args.max_steps,
+        args.num_particles,
         args.particle_updates,
         args.planning_horizon,
         args.fps,
     ) <= 0:
-        raise ValueError("Episodes, steps, particle updates, and FPS must be positive.")
+        raise ValueError(
+            "Episodes, steps, particles, particle updates, horizon, and FPS must be positive."
+        )
     if args.particle_sigma < 0.0:
         raise ValueError("--particle-sigma must be non-negative.")
 
@@ -80,6 +88,7 @@ def main() -> None:
         "device": str(device),
         "episodes": args.episodes,
         "max_steps": args.max_steps,
+        "num_particles": args.num_particles,
         "particle_updates": args.particle_updates,
         "particle_sigma": args.particle_sigma,
         "planning_horizon": args.planning_horizon,
@@ -96,6 +105,7 @@ def main() -> None:
             args.env_id,
             args.episodes,
             args.max_steps,
+            args.num_particles,
             args.particle_updates,
             args.particle_sigma,
             args.planning_horizon,
@@ -126,9 +136,11 @@ def load_model(model_name: str, checkpoint_path: Path, device: torch.device) -> 
         raise FileNotFoundError(f"Checkpoint not found for {model_name}: {checkpoint_path}")
     package = importlib.import_module(model_name)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if checkpoint.get("architecture_version") != 2:
+    expected_version = {"trans_wm": 3, "trans_wm_le": 4}[model_name]
+    if checkpoint.get("architecture_version") != expected_version:
         raise ValueError(
-            f"{checkpoint_path} predates action-conditioned rewards; retrain from scratch."
+            f"{checkpoint_path} is incompatible with the ensemble-critic architecture; "
+            "retrain from scratch."
         )
     model = package.WorldModel(package.WorldModelConfig(**checkpoint["model_config"])).to(device)
     model.load_state_dict(checkpoint["model"])
@@ -142,6 +154,7 @@ def evaluate_online(
     env_id: str,
     episodes: int,
     max_steps: int,
+    num_particles: int,
     particle_updates: int,
     particle_sigma: float,
     planning_horizon: int,
@@ -152,7 +165,7 @@ def evaluate_online(
     record_video: bool,
 ) -> dict[str, Any]:
     _validate_policy_environment(env_id, model)
-    policy = ParticlePolicy()
+    policy = ParticlePolicy(num_particles=num_particles, horizon=planning_horizon)
     parameter = next(model.parameters())
     generator = torch.Generator(device=parameter.device).manual_seed(seed)
     episode_records = []
@@ -167,7 +180,6 @@ def evaluate_online(
                 max_steps,
                 particle_updates,
                 particle_sigma,
-                planning_horizon,
                 seed + episode,
                 generator,
                 record_frames=record_video and episode == 0,
@@ -213,7 +225,6 @@ def run_online_episode(
     max_steps: int,
     particle_updates: int,
     particle_sigma: float,
-    planning_horizon: int,
     seed: int,
     generator: torch.Generator,
     *,
@@ -228,15 +239,16 @@ def run_online_episode(
     predicted_rewards: list[float] = []
     predicted_values: list[float] = []
     rollout_latents: list[torch.Tensor] = []
+    bootstrap_values: list[torch.Tensor] = []
 
     for timestep in range(max_steps):
         observation_history, observation_valid = _observation_history(images, model)
         action_history, action_valid = _action_history(actions, model)
         with torch.inference_mode():
             if model_name == "trans_wm":
-                latent = model.encode(observation_history, observation_valid)
+                latent = model.encode_ema(observation_history, observation_valid)
             else:
-                latent = model.encode(
+                latent = model.encode_ema(
                     observation_history, observation_valid, action_history, action_valid
                 )
             action, predicted_reward, predicted_value = select_particle_action(
@@ -248,11 +260,20 @@ def run_online_episode(
                 policy,
                 particle_updates,
                 particle_sigma,
-                planning_horizon,
                 generator,
             )
+            if return_training_data:
+                bootstrap_value = _predict_ema_bootstrap_value(
+                    model_name,
+                    model,
+                    latent,
+                    action_history,
+                    action_valid,
+                    action,
+                )
         if return_training_data:
             rollout_latents.append(latent.detach())
+            bootstrap_values.append(bootstrap_value.detach().reshape(()))
         action_array = action.detach().cpu().numpy().reshape(model.config.action_shape)
         _, reward, terminated, truncated, _ = env.step(action_array)
         actions.append(action_array.astype(np.float32, copy=False))
@@ -260,6 +281,8 @@ def run_online_episode(
         predicted_rewards.append(float(predicted_reward.item()))
         predicted_values.append(float(predicted_value.item()))
         images.append(_render_model_image(env, model.config.observation_shape))
+        if return_training_data and terminated:
+            bootstrap_values[-1] = torch.zeros_like(bootstrap_values[-1])
         if record_frames:
             frames.append(
                 _online_video_frame(
@@ -286,7 +309,25 @@ def run_online_episode(
             device=record["latents"].device,
             dtype=record["latents"].dtype,
         )
+        record["bootstrap_values"] = torch.stack(bootstrap_values)
     return record
+
+
+def _predict_ema_bootstrap_value(
+    model_name: str,
+    model: Any,
+    latent: torch.Tensor,
+    action_history: torch.Tensor,
+    action_valid: torch.Tensor,
+    action: torch.Tensor,
+) -> torch.Tensor:
+    if model_name == "trans_wm":
+        next_latent = model.predict_next_ema(
+            latent, action_history, action, action_valid
+        )
+    else:
+        next_latent = model.predict_next_ema(latent, action)
+    return model.ema_heads.value_head.minimum(next_latent)
 
 
 def select_particle_action(
@@ -298,7 +339,6 @@ def select_particle_action(
     policy: ParticlePolicy,
     particle_updates: int,
     particle_sigma: float,
-    planning_horizon: int,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     parameter = next(model.parameters())
@@ -313,7 +353,6 @@ def select_particle_action(
             action_history,
             action_valid,
             particles,
-            planning_horizon,
         )
         particles = policy.update_particles(
             particles, scores, sigma=particle_sigma, generator=generator
@@ -325,11 +364,10 @@ def select_particle_action(
         action_history,
         action_valid,
         particles,
-        planning_horizon,
     )
     best = scores.argmax(dim=1)
     batch_indices = torch.arange(len(best), device=best.device)
-    action = particles[batch_indices, best]
+    action = particles[batch_indices, best, 0]
     return action, rewards[batch_indices, best], values[batch_indices, best]
 
 
@@ -340,13 +378,15 @@ def score_particles(
     action_history: torch.Tensor,
     action_valid: torch.Tensor,
     particles: torch.Tensor,
-    planning_horizon: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size, num_particles, action_dim = particles.shape
+    if particles.ndim != 4:
+        raise ValueError("particles must have shape [batch, particles, horizon, action_dim].")
+    batch_size, num_particles, horizon, action_dim = particles.shape
+    if horizon == 0:
+        raise ValueError("particle sequence horizon must be positive.")
     repeated_latent = latent[:, None].expand(-1, num_particles, -1).reshape(
         batch_size * num_particles, -1
     )
-    flat_actions = particles.reshape(batch_size * num_particles, action_dim)
     repeated_history = action_history[:, None].expand(
         -1, num_particles, -1, -1
     ).reshape(batch_size * num_particles, ACTION_HISTORY_LEN, action_dim)
@@ -356,7 +396,10 @@ def score_particles(
     scores = torch.zeros(batch_size, num_particles, device=latent.device, dtype=latent.dtype)
     discount = 1.0
     first_rewards = None
-    for _ in range(planning_horizon):
+    for timestep in range(horizon):
+        flat_actions = particles[:, :, timestep].reshape(
+            batch_size * num_particles, action_dim
+        )
         rewards = model.ema_heads.reward(repeated_latent, flat_actions).reshape(
             batch_size, num_particles
         )
@@ -365,7 +408,7 @@ def score_particles(
         scores = scores + discount * rewards
         discount *= model.config.gamma
         if model_name == "trans_wm":
-            repeated_latent = model.predict_next(
+            repeated_latent = model.predict_next_ema(
                 repeated_latent, repeated_history, flat_actions, repeated_valid
             )
             package = importlib.import_module(model_name)
@@ -373,13 +416,11 @@ def score_particles(
                 repeated_history, repeated_valid, flat_actions
             )
         else:
-            repeated_latent = model.predict_next(repeated_latent, flat_actions)
-    terminal_values = model.ema_heads.value_head(repeated_latent).reshape(
+            repeated_latent = model.predict_next_ema(repeated_latent, flat_actions)
+    terminal_values = model.ema_heads.value_head.mean(repeated_latent).reshape(
         batch_size, num_particles
     )
     scores = scores + discount * terminal_values
-    if first_rewards is None:
-        raise ValueError("planning_horizon must be positive.")
     return scores, first_rewards, terminal_values
 
 

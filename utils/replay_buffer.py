@@ -91,6 +91,11 @@ class RolloutReplayBuffer:
     def num_stored(self) -> int:
         return sum(batch.num_transitions for batch in self._batches)
 
+    @property
+    def batches(self) -> tuple[EpisodeBatch, ...]:
+        """Returns the stored rollout batches without copying their arrays."""
+        return tuple(self._batches)
+
     def rng_state(self) -> dict:
         return self._rng.bit_generator.state
 
@@ -287,3 +292,57 @@ class RolloutReplayBuffer:
         if batch.images is not None:
             arrays["images"] = batch.images
         np.savez_compressed(path, **arrays)
+
+
+class OfflineRolloutDataset:
+    """Read-only, RAM-resident rollout dataset without a run-directory mirror."""
+
+    def __init__(
+        self,
+        source_dir: str | Path,
+        *,
+        max_rollouts: int | None = None,
+        seed: int | None = None,
+    ) -> None:
+        source_dir = Path(source_dir)
+        metadata = RolloutReplayBuffer._read_metadata(source_dir)
+        source_files = metadata.get("rollout_files") or ["replay_buffer.npz"]
+        capacity = RolloutReplayBuffer._capacity(
+            max_rollouts if max_rollouts is not None else len(source_files)
+        )
+        num_envs = int(metadata.get("num_envs", 1))
+        self._rng = np.random.default_rng(seed)
+        self._batches = [
+            RolloutReplayBuffer._read_source(source_dir / filename, num_envs)
+            for filename in source_files[-capacity:]
+        ]
+
+    @property
+    def num_rollouts(self) -> int:
+        return len(self._batches)
+
+    @property
+    def num_stored(self) -> int:
+        return sum(batch.num_transitions for batch in self._batches)
+
+    @property
+    def batches(self) -> tuple[EpisodeBatch, ...]:
+        return tuple(self._batches)
+
+    def rng_state(self) -> dict:
+        return self._rng.bit_generator.state
+
+    def load_rng_state(self, state: dict) -> None:
+        self._rng.bit_generator.state = state
+
+    def sample(self, num_rollouts: int = DEFAULT_SAMPLE_ROLLOUTS) -> EpisodeBatch:
+        if num_rollouts <= 0:
+            raise ValueError("num_rollouts must be positive.")
+        indices = self._rng.choice(
+            self.num_rollouts,
+            size=num_rollouts,
+            replace=self.num_rollouts < num_rollouts,
+        )
+        return RolloutReplayBuffer._combine_batches(
+            [self._batches[index] for index in indices]
+        )
