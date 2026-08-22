@@ -7,7 +7,7 @@
 - 当前图像历史编码得到的 `z tensor`；
 - 最近 9 个已执行 action 组成的 action history。
 
-外部 policy 给出当前 action 后，Dynamics 直接预测确定性的下一个 `z tensor`。随后 Heads 根据预测状态计算 observation、reward、value 和 action score。
+外部 policy 给出当前 action 后，Dynamics 直接预测确定性的下一个 `z tensor`。Heads 从 latent 预测 observation，并从当前 latent 与 action 预测 reward；模型不包含 Value head。
 
 ## 运行框架
 
@@ -52,14 +52,11 @@ flowchart LR
         DEC["CNN Decoder"]
         OH["重建的 10 张图像<br/>B x 10 x C x H x W"]
         RH["Reward Head<br/>r_hat"]
-        VH["Value Head<br/>V_hat"]
-        SCORE["action score / Q 估计<br/>r_hat + gamma * V_hat"]
+        SCORE["multi-step score<br/>reward sum"]
         ZN --> DEC --> OH
         SAMPLE -. 同窗口 VAE 重建 .-> DEC
         ZN --> RH
-        ZN --> VH
         RH --> SCORE
-        VH --> SCORE
     end
 
     ZN -->|直接替换当前 z| NEXT["下一 rollout step"]
@@ -133,7 +130,7 @@ z_hat_{t+1}: [B, latent_dim]
 
 ## Heads 与 Action Score
 
-三个 Heads 都直接读取单个当前 `z tensor`，不读取 latent history。
+Observation Head 和 Reward Head 都直接读取单个当前 `z tensor`，不读取 latent history。
 
 ### Observation Head
 
@@ -167,15 +164,6 @@ r_hat_t = RewardHead(z_t, a_t)
 
 这与 Pendulum 在状态积分前由当前状态和 action 计算 reward 的时间语义一致。
 
-### Value Head
-
-Value Head 输出完整的当前状态 Value，不再区分 `bootstrap_value` 和 `current_value`：
-
-```text
-value_hat = V_hat(z)
-value_hat: [B, 1]
-```
-
 ### Action Score
 
 外部 policy 的 action 先经过 Dynamics 得到下一个状态，再通过 Heads 计算分数：
@@ -183,12 +171,11 @@ value_hat: [B, 1]
 ```text
 z_hat_{t+1} = Dynamics(z_t, ah_t, a_t)
 
-score(z_t, a_t)
-    = reward_hat(z_t, a_t)
-    + gamma * value_hat(z_hat_{t+1})
+score(a_t:t+H-1)
+    = sum_k reward_hat(z_t+k, a_t+k)
 ```
 
-这个 score 是基于 action-conditioned next state 得到的 Q 估计。world model 只返回 score，不负责比较、搜索或选择 action。
+规划器使用 EMA dynamics rollout 候选动作序列，直接累加多步预测 reward；不折扣，也不添加 terminal value。
 
 ## Padding 与 Mask
 
@@ -202,7 +189,7 @@ actions:    [PAD PAD PAD PAD PAD PAD PAD a0 a1]
 action mask:[ 0   0   0   0   0   0   0  1  1]
 ```
 
-训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。Value 使用真实 reward 与 EMA world-model bootstrap 构造 TD(lambda) return；真正 `terminated` 时 bootstrap 为零，时间截断时保留 bootstrap。
+训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。
 
 ## 训练时间对齐
 
@@ -216,8 +203,7 @@ action mask:[ 0   0   0   0   0   0   0  1  1]
 
 Dynamics(z_t, ah_t, a_t) -> z_hat_{t+1}
 ObservationHead(z_t)      -> 10-frame history ending at o_t
-RewardHead(z_{t+1})       -> r_t
-min_k ValueHead_k(z_t)    -> V_t
+RewardHead(z_t, a_t)      -> r_t
 ```
 
 ## 损失函数
@@ -252,18 +238,7 @@ L_vae_recon = mean((Decoder(z_sample) - window)^2)
 L_vae_kl = -0.5 * mean(1 + log_variance - mean^2 - exp(log_variance))
 ```
 
-这项辅助任务持续更新 CNN Encoder/Decoder，保护图像表征稳定。Dynamics 不再使用 `z_hat` 与 encoder latent 之间的 NLL、MSE 或任何直接 latent matching 约束；它只通过下一窗口 observation、reward 和 value 任务获得训练信号。
-
-### Value 损失
-
-Value 不使用 replay transition 的 Bellman target。每个训练单元执行当前粒子策略的真实在线 episode，并用 EMA world model 的一步预测和最差 EMA critic 计算 TD(lambda) target：
-
-```text
-G_t^lambda = r_t + gamma * ((1 - lambda) * V^-_EMA(z_hat_{t+1}) + lambda * G_{t+1}^lambda)
-L_value(t) = (min_k V_k(sg(z_t)) - G_t^lambda)^2
-```
-
-在线 rollout 使用冻结的 EMA encoder、dynamics 和 critic ensemble。lambda bootstrap 和 critic 更新使用最小 critic，planning 使用 critic 均值。Replay optimizer 明确排除 critics。
+这项辅助任务持续更新 CNN Encoder/Decoder，保护图像表征稳定。Dynamics 不再使用 `z_hat` 与 encoder latent 之间的 NLL、MSE 或任何直接 latent matching 约束；它通过下一窗口 observation 任务获得训练信号，Reward Head 则从当前 latent 与 action 学习 transition reward。
 
 EMA 参数在每次训练更新后更新，覆盖 Encoder、Dynamics 和全部 Heads：
 
@@ -275,7 +250,9 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 
 ### 总损失
 
-所有 loss 先在有效 transition/window 上做 masked mean，再按配置权重相加：
+训练从每个采样起点按唯一的 `PLANNING_HORIZON` 递归展开 Dynamics，默认 10 步。第 `k+1` 步使用第 `k` 步预测 latent，而不是重新编码真实状态作为 Dynamics 输入。所有有效预测步等权并按有效预测总数归一化；episode 尾部不足 horizon 的部分由 mask 排除。
+
+所有 loss 先在有效 rollout step/window 上做 masked mean，再按配置权重相加：
 
 ```text
 L_total =
@@ -325,17 +302,17 @@ z_t = model.encode(obs_history, obs_valid_mask)
 ah_t = model.action_history_tensor(action_history, action_valid_mask)
 z_next = model.predict_next(z_t, ah_t, action)
 
-# 直接从 z 预测 10 张图像、reward 和完整 state value。
+# 直接从 z 预测 10 张图像，并从 (z, action) 预测 reward。
 heads = model.predict_heads(z_t, action)
 
-# 预测 action-conditioned next state 及其 Q-style score。
+# 预测 action-conditioned next state 及当前 transition reward。
 evaluation = model.evaluate_action(
     z_t,
     action_history,
     action,
     action_valid_mask,
 )
-q_score = evaluation.score
+reward_score = evaluation.score
 
 # 对外部 action sequence rollout，只维护 action history。
 rollout = model.rollout(

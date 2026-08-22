@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
-from eval import score_particles, select_particle_action
+from eval import _particle_sigma, score_particles, select_particle_action
 from trans_wm import WorldModel as TransWorldModel
 from trans_wm import WorldModelConfig as TransWorldModelConfig
 from trans_wm_le import WorldModel as LatentWorldModel
@@ -24,7 +24,7 @@ class OnlineEvaluationTest(unittest.TestCase):
             1, 100, 1, 1
         ).expand(2, -1, -1, -1)
 
-    def test_trans_wm_scores_particle_actions_with_ema_reward_and_value(self) -> None:
+    def test_trans_wm_scores_particle_actions_with_multistep_ema_reward(self) -> None:
         model = TransWorldModel(
             TransWorldModelConfig(
                 observation_shape=(3, 32, 32),
@@ -39,7 +39,7 @@ class OnlineEvaluationTest(unittest.TestCase):
         ).eval()
         latent = torch.randn(2, 8)
 
-        scores, rewards, values = score_particles(
+        scores, rewards = score_particles(
             "trans_wm",
             model,
             latent,
@@ -50,8 +50,7 @@ class OnlineEvaluationTest(unittest.TestCase):
 
         self.assertEqual(scores.shape, (2, 100))
         self.assertEqual(rewards.shape, (2, 100))
-        self.assertEqual(values.shape, (2, 100))
-        torch.testing.assert_close(scores, rewards + model.config.gamma * values)
+        torch.testing.assert_close(scores, rewards)
 
     def test_trans_wm_le_selects_a_bounded_particle_action(self) -> None:
         model = LatentWorldModel(
@@ -65,7 +64,7 @@ class OnlineEvaluationTest(unittest.TestCase):
         ).eval()
         latent = torch.randn(2, 64)
 
-        action, predicted_reward, predicted_value = select_particle_action(
+        action, predicted_reward = select_particle_action(
             "trans_wm_le",
             model,
             latent,
@@ -74,6 +73,7 @@ class OnlineEvaluationTest(unittest.TestCase):
             ParticlePolicy(horizon=3),
             particle_updates=2,
             particle_sigma=0.1,
+            particle_temperature=1.0,
             generator=torch.Generator().manual_seed(4),
         )
 
@@ -81,25 +81,25 @@ class OnlineEvaluationTest(unittest.TestCase):
         self.assertTrue(torch.all(action >= -2.0))
         self.assertTrue(torch.all(action <= 2.0))
         self.assertEqual(predicted_reward.shape, (2,))
-        self.assertEqual(predicted_value.shape, (2,))
+
+    def test_particle_sigma_decreases_to_inverse_horizon_floor(self) -> None:
+        self.assertAlmostEqual(_particle_sigma(0.1, 25, 0), 0.1)
+        self.assertAlmostEqual(_particle_sigma(0.1, 25, 1), 0.06)
+        self.assertAlmostEqual(_particle_sigma(0.1, 25, 2), 0.04)
+        self.assertAlmostEqual(_particle_sigma(0.1, 25, 9), 0.04)
 
     def test_particle_horizon_scores_action_sequences(self) -> None:
         class Reward:
             def __call__(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
                 return action[:, :1]
 
-        class Value:
-            def mean(self, latent: torch.Tensor) -> torch.Tensor:
-                return torch.zeros((len(latent), 1), dtype=latent.dtype)
-
         model = SimpleNamespace(
-            config=SimpleNamespace(gamma=0.5),
-            ema_heads=SimpleNamespace(reward=Reward(), value_head=Value()),
+            ema_heads=SimpleNamespace(reward=Reward()),
             predict_next_ema=lambda latent, action: latent,
         )
         particles = torch.tensor([[[[1.0], [2.0], [3.0]], [[-1.0], [4.0], [2.0]]]])
 
-        scores, first_rewards, _ = score_particles(
+        scores, first_rewards = score_particles(
             "trans_wm_le",
             model,
             torch.zeros(1, 2),
@@ -108,7 +108,7 @@ class OnlineEvaluationTest(unittest.TestCase):
             particles,
         )
 
-        torch.testing.assert_close(scores, torch.tensor([[2.75, 1.5]]))
+        torch.testing.assert_close(scores, torch.tensor([[6.0, 5.0]]))
         torch.testing.assert_close(first_rewards, torch.tensor([[1.0, -1.0]]))
 
 

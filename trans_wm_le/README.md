@@ -56,12 +56,9 @@ flowchart LR
 
     subgraph Heads[直接读取 latent 的预测头]
         RH["Reward Head<br/>r_hat(t)"]
-        VH["Value Head<br/>V_hat"]
-        SCORE["action score / Q 估计<br/>r_hat + gamma * V_hat"]
+        SCORE["multi-step score<br/>reward sum"]
         ZP --> RH
-        ZP --> VH
         RH --> SCORE
-        VH --> SCORE
     end
 
     subgraph JEPATarget[JEPA Target Branch]
@@ -177,7 +174,7 @@ Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 
 
 ## Heads 与 Action Score
 
-模型不再包含 Observation Head 或图像 decoder。Reward Head 读取 64 维 latent 和当前 action，Value Head 只读取 latent。
+模型不包含 Observation Head、图像 decoder 或 Value Head。Reward Head 读取 64 维 latent 和当前 action。
 
 ### Reward Head
 
@@ -196,15 +193,6 @@ r_hat_t: [B, 1]
 
 因此 `r_hat_t` 表示执行 `a_t` 所对应的 transition reward，而不是进入 `z_t` 之前的 reward。
 
-### Critic Ensemble
-
-多个独立 critic 输出完整状态 Value；所有规划和 rollout 调用取最差值：
-
-```text
-value_hat = min_k ValueHead_k(z)
-value_hat: [B, 1]
-```
-
 ### Action Score
 
 外部 policy 的候选 action 先经过 Dynamics 得到下一 latent，再由两个 head 计算分数：
@@ -212,12 +200,11 @@ value_hat: [B, 1]
 ```text
 z_hat_{t+1} = Dynamics(z_t, a_t)
 
-score(z_t, a_t)
-    = RewardHead(z_t, a_t)
-    + gamma * min_k ValueHead_k(z_hat_{t+1})
+score(a_t:t+H-1)
+    = sum_k RewardHead(z_t+k, a_t+k)
 ```
 
-这个 score 是基于 action-conditioned next latent 的 Q-style 估计。world model 只返回 score，不负责比较、搜索或选择 action。
+规划器使用 EMA dynamics rollout 候选动作序列，直接累加多步预测 reward；不折扣，也不添加 terminal value。
 
 ## Padding 与 Mask
 
@@ -232,8 +219,6 @@ action mask: [ 0   0   0   0   0   0   0  1  1]
 ```
 
 mask 在进入 CNN 或 Latent Encoder 前显式清零 padding 值。训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition，并使用 `state_valid` 排除 SIGReg 中的无效状态。
-
-Value 使用真实 reward 与 EMA world-model bootstrap 构造 TD(lambda) return；真正 `terminated` 时 bootstrap 为零，时间截断时保留 bootstrap。
 
 ## 训练时间对齐
 
@@ -254,7 +239,6 @@ concat(obs_tensor_{t+1}, ah_{t+1})
                                   -> z_target_{t+1}
 
 RewardHead(z_t, a_t)             -> r_hat_t
-min_k ValueHead_k(z_hat_{t+1})   -> predicted next value
 ```
 
 也就是：
@@ -266,7 +250,7 @@ obs_t -> action_t -> obs_{t+1}
                     z_target_{t+1}
 ```
 
-`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则直接采样有效 transition，再为每个样本构造完全相同语义的图像与 action history。
+`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 10 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
 
 ## 损失函数
 
@@ -345,7 +329,7 @@ sigreg_frequencies   = 17
 sigreg_max_frequency = 5.0
 ```
 
-完整序列训练对所有 `state_valid` 的在线 latent 计算 SIGReg；采样 transition 训练则对当前和下一在线 latent 的拼接计算 SIGReg。
+完整序列训练对所有 `state_valid` 的在线 latent 计算 SIGReg；采样训练则对当前和 horizon 内所有有效未来在线 latent 计算 SIGReg。
 
 ### Reward Loss
 
@@ -353,22 +337,11 @@ sigreg_max_frequency = 5.0
 L_reward(t) = (RewardHead(z_t, a_t) - r_t)^2
 ```
 
-Reward loss 更新 Encoder 和 Reward Head；Dynamics 由 JEPA loss 更新。
-
-### Value Loss
-
-Value 不从 replay buffer 更新。每个训练单元用当前粒子策略执行真实在线 episode，并用 EMA world model 的一步预测和最差 EMA critic 计算 TD(lambda) target：
-
-```text
-G_t^lambda = r_t + gamma * ((1 - lambda) * V^-_EMA(z_hat_{t+1}) + lambda * G_{t+1}^lambda)
-L_value(t) = (min_k V_k(stop_gradient(z_t)) - G_t^lambda)^2
-```
-
-在线 latent 和 bootstrap 来自冻结的 EMA world model。lambda bootstrap 和 critic 更新使用最小 critic，planning 使用 critic 均值；replay optimizer 明确排除 critics。
+第一步 Reward loss 更新 Encoder 和 Reward Head；后续步读取递归预测 latent，因此也会向 Dynamics 反传。Dynamics 同时由所有预测步的 JEPA loss 更新。
 
 ### 总损失
 
-所有 transition loss 先在有效 transition 上做 mean 或 masked mean，再按配置权重相加：
+所有 horizon 内有效预测步等权，并按有效预测总数做 masked mean，因此增大 horizon 不会直接线性放大 loss。episode 尾部越界位置不参与更新。随后各项 loss 按配置权重相加：
 
 ```text
 L_total =
@@ -377,7 +350,7 @@ L_total =
     + reward_weight * L_reward
 ```
 
-四项权重默认均为 `1.0`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
+`jepa_weight` 和 `reward_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
 
 ## EMA Target 与 Policy API
 
@@ -392,7 +365,7 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 - Observation Encoder；
 - Latent Encoder；
 - Latent Dynamics；
-- Reward Head 和 Value Head。
+- Reward Head。
 
 默认公共 API `encode`、`predict_next`、`predict_heads`、`evaluate_action` 和 `rollout` 使用冻结的 EMA 模块并禁用梯度。训练器显式调用对应的在线 API。
 
@@ -440,7 +413,7 @@ trainer = WorldModelTrainer(
     model,
     TrainingConfig(
         jepa_weight=1.0,
-        sigreg_weight=1.0,
+        sigreg_weight=0.2,
         sigreg_projections=256,
         sigreg_frequencies=17,
         sigreg_max_frequency=5.0,
@@ -461,10 +434,10 @@ z_t = model.encode(
 # Dynamics 只需要当前 64D latent 和当前 action。
 z_next = model.predict_next(z_t, action)
 
-# 从 latent 预测 reward、value，并计算 Q-style score。
-heads = model.predict_heads(z_next, action)
+# 从当前 latent 和 action 预测 transition reward。
+heads = model.predict_heads(z_t, action)
 evaluation = model.evaluate_action(z_t, action)
-q_score = evaluation.score
+reward_score = evaluation.score
 
 # 对外部 action sequence rollout，同时维护并返回 action history。
 rollout = model.rollout(
@@ -477,12 +450,12 @@ rollout = model.rollout(
 
 ## 命令行训练
 
-推荐使用仓库根目录下的运行脚本。网络结构使用 `WorldModelConfig` 中的固定配置：observation dim 128、Transformer model dim 256、3 层、4 个 attention heads、FFN dim 512、CNN channels `(32, 64, 128)`、dropout 0。critic 数量通过预训练脚本的 `NUM_CRITICS` 配置（默认 2），正式训练从预训练 checkpoint 读取该数量及其余模型配置。训练参数可以通过环境变量覆盖：
+推荐使用仓库根目录下的运行脚本。网络结构使用 `WorldModelConfig` 中的固定配置：observation dim 128、Transformer model dim 256、3 层、4 个 attention heads、FFN dim 512、CNN channels `(32, 64, 128)`、dropout 0。训练参数可以通过环境变量覆盖：
 
-依次执行预训练和正式训练：
+依次执行预训练、正式训练和最终在线评估：
 
 ```bash
-DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 NUM_CRITICS=5 \
+DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
 ./run_integrate_trans_wm_le.sh
 ```
 
@@ -493,7 +466,7 @@ ROLLOUTS=500 \
 BATCH_SIZE=16 \
 DEVICE=cuda \
 JEPA_WEIGHT=1.0 \
-SIGREG_WEIGHT=0.1 \
+SIGREG_WEIGHT=0.2 \
 ./run_train_trans_wm_le.sh
 ```
 
@@ -504,7 +477,7 @@ python -m trans_wm_le.train \
     --data-dir dataset \
     --output-dir runs/trans_wm_le \
     --jepa-weight 1.0 \
-    --sigreg-weight 1.0
+    --sigreg-weight 0.2
 ```
 
 数据目录需要包含 `dataset.json` 以及其中列出的 rollout `.npz` 文件。每个 rollout 文件必须包含：
@@ -516,5 +489,5 @@ obs, images, action, reward, terminated, truncated, lengths
 训练会保存模型配置、训练配置、optimizer 状态、NumPy/Torch RNG 状态以及 EMA 参数。日志指标包括：
 
 ```text
-total, jepa, sigreg, reward, value
+total, jepa, sigreg, reward
 ```

@@ -20,26 +20,27 @@ with shape `(NUM_ENVS, T, ...)`, and `lengths` to mask padded time steps.
 
 ## Train Trans-WM
 
-Pretrain the world-model components before enabling online critic training:
+Pretrain the world-model components before multi-step reward planning:
 
 ```bash
 ./run_pretrain_trans_wm.sh
 # Or: ./run_pretrain_trans_wm_le.sh
 ```
 
-Run pretraining and formal training sequentially with one command:
+Run pretraining, formal training, and final online evaluation sequentially with
+one command:
 
 ```bash
-DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 NUM_CRITICS=5 \
+DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
 ./run_integrate_trans_wm.sh
 
 # Trans-WM-LE:
-DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 NUM_CRITICS=5 \
+DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
 ./run_integrate_trans_wm_le.sh
 ```
 
-Pretraining uses replay updates only. It does not create a Gym environment,
-run the particle policy, or update the critic ensemble. Validation loss selects
+Pretraining uses replay updates only. It does not create a Gym environment or
+run the particle policy. Validation loss selects
 `checkpoint_best.pt`; the two newest numbered checkpoints are retained for
 `RESUME`-based pretraining continuation. `EPOCHS` controls complete passes over
 all valid offline transitions; transitions are shuffled and visited exactly
@@ -58,12 +59,12 @@ PRETRAINED_CHECKPOINT=runs/trans_wm_le_pretrain/checkpoint_best.pt \
 ```
 
 `PRETRAINED_CHECKPOINT` restores the model and world optimizer, but starts the
-formal rollout counter, critic optimizer, RNG streams, and best-return tracking
+formal rollout counter, RNG streams, and best-return tracking
 fresh. `RESUME` instead restores the complete state of the same phase. The two
 options are mutually exclusive, and model/training configuration must match
 the checkpoint.
 
-To train the CNN/Transformer world model and critic together without a
+To train the CNN/Transformer world model without a
 pretraining phase, run:
 
 ```bash
@@ -104,20 +105,19 @@ default (`SAMPLE_ROLLOUTS=2`) before sampling transitions. Periodic evaluation
 uses a fixed transition sample.
 
 Replay updates train the encoder, dynamics, and action-conditioned reward model
-`R(z_t, a_t)`. They do not update the value head. Each training unit also runs
-the current particle policy in the real Gymnasium environment (two complete
-episodes by default, `VALUE_ROLLOUTS=2`) and trains only `V(z_t)` against the
-TD(lambda) return. Its one-step bootstrap latent is predicted by the EMA world
-model and evaluated by the worst EMA critic. Critic training also uses the
-ensemble minimum. `GAMMA` and `LAMBDA_RETURN` both default to `0.95`. Planning
-uses `GAMMA`, the ensemble mean, and the
-shell-configured `NUM_PARTICLES` and `PLANNING_HORIZON`. Every 10 training rollouts, the
+`R(z_t, a_t)`. Particle planning scores candidates by directly summing multi-step
+predicted rewards; there is no discount, value head, or critic update. Every 10 training rollouts, the
 policy is evaluated over 10 separate episodes. The two newest numbered
 checkpoints are retained for resuming, while `checkpoint_best.pt` retains the
 highest evaluation return.
 
-The ensemble critic is an architecture change. Older single-critic checkpoints
-are rejected explicitly and must be retrained from scratch.
+World-model updates use the same `PLANNING_HORIZON` as policy evaluation. From
+each sampled starting state, dynamics is recursively unrolled over consecutive
+dataset actions. Every valid prediction step contributes equally to the
+normalized loss; episode-tail padding is masked and no discount is applied.
+
+Checkpoints from the previous value-head architecture are rejected explicitly
+and must be retrained from scratch.
 
 ## Online evaluation
 
@@ -134,6 +134,5 @@ EPISODES=5 DEVICE=cuda \
 
 Results include per-episode online returns, a same-seed random-policy baseline,
 an online return plot, and a GIF recorded from the first environment episode.
-The default planning horizon is one model step. Longer model planning must be
-requested explicitly with `PLANNING_HORIZON` and should only be used after
-multi-step prediction quality has been validated.
+The default `PLANNING_HORIZON` is ten model steps and is shared by recursive
+world-model training and particle planning.

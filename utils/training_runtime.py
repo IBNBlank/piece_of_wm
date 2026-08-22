@@ -247,7 +247,6 @@ def save_checkpoint(
             "training_config": asdict(training_config),
             "model": model.state_dict(),
             "optimizer": trainer.optimizer.state_dict(),
-            "value_optimizer": trainer.value_optimizer.state_dict(),
             "architecture_version": architecture_version,
             "checkpoint_format_version": 2,
             "numpy_rng": rng.bit_generator.state,
@@ -286,7 +285,7 @@ def restore_checkpoint(
 ) -> CheckpointState:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if checkpoint.get("architecture_version") != architecture_version:
-        raise ValueError("Checkpoint predates ensemble critics; retrain from scratch.")
+        raise ValueError("Checkpoint uses the removed value head; retrain from scratch.")
     phase = checkpoint.get("phase", "training")
     if phase != expected_phase:
         raise ValueError(
@@ -304,7 +303,6 @@ def restore_checkpoint(
         raise ValueError("Checkpoint training configuration does not match CLI configuration.")
     model.load_state_dict(checkpoint["model"])
     trainer.optimizer.load_state_dict(checkpoint["optimizer"])
-    trainer.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
     rng.bit_generator.state = checkpoint["numpy_rng"]
     if checkpoint.get("checkpoint_format_version") == 2:
         replay_buffer.load_rng_state(checkpoint["replay_rng"])
@@ -356,16 +354,8 @@ def load_pretrained_checkpoint(
         raise ValueError("Pretraining model configuration does not match CLI configuration.")
     if checkpoint["training_config"] != asdict(training_config):
         raise ValueError("Pretraining optimizer configuration does not match CLI configuration.")
-    world_state = {
-        name: value
-        for name, value in checkpoint["model"].items()
-        if not _is_value_head_parameter(name)
-    }
-    incompatible = model.load_state_dict(world_state, strict=False)
-    expected_missing = {
-        name for name in model.state_dict() if _is_value_head_parameter(name)
-    }
-    if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+    incompatible = model.load_state_dict(checkpoint["model"], strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
         raise ValueError("Pretraining checkpoint world-model state is incomplete.")
     trainer.optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -385,10 +375,6 @@ def read_pretrained_checkpoint(
     if checkpoint.get("phase") != "pretrain":
         raise ValueError("--pretrained-checkpoint requires a pretraining checkpoint.")
     return checkpoint
-
-
-def _is_value_head_parameter(name: str) -> bool:
-    return name.startswith("heads.value_head.") or name.startswith("ema_heads.value_head.")
 
 
 def resolve_resume_checkpoint(path: Path) -> Path:

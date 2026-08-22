@@ -17,7 +17,6 @@ from trans_wm import (
     WorldModel,
     WorldModelConfig,
     WorldModelTrainer,
-    discounted_returns,
     sample_transition_batch,
     tensor_episode_batch,
     world_model_loss,
@@ -119,19 +118,16 @@ class WorldModelShapeTest(unittest.TestCase):
 
         self.assertEqual(output.observation.shape, (3, OBS_HISTORY_LEN, 3, 32, 32))
         self.assertEqual(output.reward.shape, (3, 1))
-        self.assertEqual(output.value.shape, (3, 1))
+        self.assertFalse(hasattr(output, "value"))
 
-    def test_action_score_is_reward_plus_discounted_next_state_value(self) -> None:
+    def test_action_score_is_current_reward(self) -> None:
         z = torch.randn(2, 8)
         action_history = torch.randn(2, ACTION_HISTORY_LEN, 2)
         action = torch.randn(2, 2)
 
         result = self.model.evaluate_action(z, action_history, action)
 
-        torch.testing.assert_close(
-            result.score,
-            result.heads.reward + self.model.config.gamma * result.heads.value,
-        )
+        torch.testing.assert_close(result.score, result.heads.reward)
         self.assertEqual(result.score.shape, (2, 1))
 
     def test_rollout_maintains_only_action_history(self) -> None:
@@ -145,7 +141,7 @@ class WorldModelShapeTest(unittest.TestCase):
         self.assertEqual(output.latents.shape, (2, 3, 8))
         self.assertEqual(output.observations.shape, (2, 3, 10, 3, 32, 32))
         self.assertEqual(output.rewards.shape, (2, 3, 1))
-        self.assertEqual(output.values.shape, (2, 3, 1))
+        self.assertFalse(hasattr(output, "values"))
         self.assertEqual(output.scores.shape, (2, 3, 1))
         self.assertEqual(output.final_z.shape, (2, 8))
         self.assertEqual(output.final_action_history.shape, (2, 9, 2))
@@ -198,17 +194,8 @@ class WorldModelTrainingTest(unittest.TestCase):
         self.assertEqual(on_update.call_count, 3)
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 
-    def test_discounted_returns_are_aligned_with_current_state(self) -> None:
-        returns = discounted_returns(torch.tensor([1.0, 2.0, 3.0]), gamma=0.5)
-        torch.testing.assert_close(returns, torch.tensor([2.75, 3.5, 3.0]))
-
-    def test_replay_update_does_not_train_value_head(self) -> None:
-        model = WorldModel(_config())
-        trainer = WorldModelTrainer(model, TrainingConfig())
-        before = [parameter.detach().clone() for parameter in model.heads.value_head.parameters()]
-        trainer.train_transitions(_batch(), batch_size=3, rng=np.random.default_rng(1))
-        for previous, current in zip(before, model.heads.value_head.parameters(), strict=True):
-            torch.testing.assert_close(previous, current, rtol=0.0, atol=0.0)
+    def test_value_head_is_absent(self) -> None:
+        self.assertFalse(hasattr(WorldModel(_config()).heads, "value_head"))
 
     def test_reward_is_conditioned_on_current_latent_and_action(self) -> None:
         model = WorldModel(_config())
@@ -224,7 +211,7 @@ class WorldModelTrainingTest(unittest.TestCase):
     def test_transition_sampler_preserves_frame_history_alignment(self) -> None:
         model = WorldModel(_config())
         sampled = sample_transition_batch(
-            _batch(), model, batch_size=6, rng=np.random.default_rng(4)
+            _batch(), model, batch_size=6, rng=np.random.default_rng(4), planning_horizon=10
         )
 
         self.assertEqual(sampled.current_observations.shape, (6, 10, 3, 32, 32))
@@ -235,6 +222,33 @@ class WorldModelTrainingTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(sampled.current_obs_valid[:, 1:], sampled.next_obs_valid[:, :-1])
         )
+
+    def test_transition_sampler_builds_masked_multistep_targets(self) -> None:
+        model = WorldModel(_config())
+        sampled = training_module.transition_batch_from_indices(
+            _batch(), model, np.asarray([0, 2]), planning_horizon=3
+        )
+
+        self.assertEqual(sampled.actions.shape, (2, 3, 2))
+        self.assertEqual(sampled.target_observations.shape, (2, 3, 10, 3, 32, 32))
+        torch.testing.assert_close(
+            sampled.transition_valid,
+            torch.tensor([[True, True, False], [True, True, True]]),
+        )
+
+    def test_transition_loss_recursively_predicts_each_horizon_step(self) -> None:
+        model = WorldModel(_config())
+        config = TrainingConfig(planning_horizon=3)
+        sampled = training_module.transition_batch_from_indices(
+            _batch(), model, np.asarray([2]), planning_horizon=3
+        )
+
+        with mock.patch.object(
+            model, "predict_next_online", wraps=model.predict_next_online
+        ) as predict_next:
+            training_module.transition_world_model_loss(model, sampled, config)
+
+        self.assertEqual(predict_next.call_count, 3)
 
     def test_vae_kl_is_zero_for_standard_normal_posterior(self) -> None:
         mean = torch.zeros(2, 8)
@@ -265,7 +279,7 @@ class WorldModelTrainingTest(unittest.TestCase):
 
         self.assertEqual(
             set(metrics),
-            {"total", "observation", "reward", "value", "vae_reconstruction", "vae_kl"},
+            {"total", "observation", "reward", "vae_reconstruction", "vae_kl"},
         )
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 

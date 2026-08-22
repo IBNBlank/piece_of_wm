@@ -14,10 +14,11 @@
 #   TRANS_WM_LE_CHECKPOINT  : Trans-WM-LE checkpoint path
 #   EPISODES                : online evaluation episodes (default: 5)
 #   MAX_STEPS               : maximum environment steps per episode (default: 200)
-#   NUM_PARTICLES           : action particles per policy update (default: 100)
-#   PARTICLE_UPDATES        : particle resampling iterations per action (default: 4)
+#   NUM_PARTICLES           : action particles per policy update (default: 1000)
+#   PARTICLE_UPDATES        : particle resampling iterations per action (default: 5)
 #   PARTICLE_SIGMA          : particle perturbation standard deviation (default: 0.1)
-#   PLANNING_HORIZON        : model steps used to score each candidate (default: 1)
+#   PARTICLE_TEMPERATURE    : softmax resampling temperature (default: 2.0)
+#   PLANNING_HORIZON        : model steps used for training and planning (default: 10)
 #   SEED                    : environment and policy seed
 #   DEVICE                  : torch device; empty selects CUDA when available
 #   OUTPUT                  : JSON results path
@@ -50,10 +51,11 @@ TRANS_WM_CHECKPOINT="${TRANS_WM_CHECKPOINT:-runs/trans_wm/checkpoint_best.pt}"
 TRANS_WM_LE_CHECKPOINT="${TRANS_WM_LE_CHECKPOINT:-runs/trans_wm_le/checkpoint_best.pt}"
 EPISODES="${EPISODES:-5}"
 MAX_STEPS="${MAX_STEPS:-200}"
-PARTICLE_UPDATES="${PARTICLE_UPDATES:-4}"
-NUM_PARTICLES="${NUM_PARTICLES:-100}"
+PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
+NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-1}"
+PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
 SEED="${SEED:-0}"
 DEVICE="${DEVICE:-}"
 OUTPUT="${OUTPUT:-runs/eval/results.json}"
@@ -73,6 +75,7 @@ args=(
 	--particle-updates "${PARTICLE_UPDATES}"
 	--num-particles "${NUM_PARTICLES}"
 	--particle-sigma "${PARTICLE_SIGMA}"
+	--particle-temperature "${PARTICLE_TEMPERATURE}"
 	--planning-horizon "${PLANNING_HORIZON}"
 	--seed "${SEED}"
 	--output "${OUTPUT}"
@@ -84,7 +87,7 @@ if [ -n "${DEVICE}" ]; then
 fi
 
 echo "[run_eval] ONLINE model=${MODEL} env_id=${ENV_ID} episodes=${EPISODES} max_steps=${MAX_STEPS}"
-echo "[run_eval] particles=${NUM_PARTICLES} particle_updates=${PARTICLE_UPDATES} sigma=${PARTICLE_SIGMA} planning_horizon=${PLANNING_HORIZON} device=${DEVICE:-auto} seed=${SEED}"
+echo "[run_eval] particles=${NUM_PARTICLES} particle_updates=${PARTICLE_UPDATES} sigma=${PARTICLE_SIGMA} temperature=${PARTICLE_TEMPERATURE} planning_horizon=${PLANNING_HORIZON} device=${DEVICE:-auto} seed=${SEED}"
 
 # shellcheck disable=SC2086
 "${PYTHON}" "${SCRIPT_DIR}/eval.py" "${args[@]}" ${EXTRA_ARGS} "$@"

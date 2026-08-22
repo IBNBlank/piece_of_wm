@@ -43,17 +43,16 @@ class TrainingCheckpointTest(unittest.TestCase):
                 max_steps=2,
                 replay_capacity=None,
                 pretrained_checkpoint=None,
-                num_critics=2,
-                gamma=0.95,
                 target_ema=0.99,
                 learning_rate=1e-4,
                 weight_decay=1e-5,
                 grad_clip_norm=10.0,
                 jepa_weight=1.0,
-                sigreg_weight=1.0,
+                sigreg_weight=0.2,
                 sigreg_projections=8,
                 sigreg_frequencies=4,
                 sigreg_max_frequency=5.0,
+                planning_horizon=10,
                 sample_rollouts=1,
                 pretrain=True,
             )
@@ -90,12 +89,23 @@ class TrainingCheckpointTest(unittest.TestCase):
             run_pretraining.assert_called_once()
             make_env.assert_not_called()
 
-    def test_training_gamma_defaults_match(self) -> None:
+    def test_training_cli_has_no_gamma(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
             with self.subTest(module=module.__name__), mock.patch(
                 "sys.argv", ["train", "--data-dir", "dataset"]
             ):
-                self.assertEqual(module.parse_args().gamma, 0.95)
+                self.assertFalse(hasattr(module.parse_args(), "gamma"))
+
+    def test_training_particle_defaults(self) -> None:
+        for module in (trans_wm_train, trans_wm_le_train):
+            with self.subTest(module=module.__name__), mock.patch(
+                "sys.argv", ["train", "--data-dir", "dataset"]
+            ):
+                args = module.parse_args()
+                self.assertEqual(args.particle_updates, 5)
+                self.assertEqual(args.num_particles, 1000)
+                self.assertEqual(args.particle_temperature, 2.0)
+                self.assertEqual(args.planning_horizon, 10)
 
     def test_rolling_checkpoints_keep_latest_two_and_resolve_latest(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
@@ -150,7 +160,7 @@ class TrainingCheckpointTest(unittest.TestCase):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "checkpoint_000010.pt"
                 model = _Stateful()
-                trainer = SimpleNamespace(optimizer=_Stateful(), value_optimizer=_Stateful())
+                trainer = SimpleNamespace(optimizer=_Stateful())
                 rng = np.random.default_rng(1)
                 replay_buffer = RolloutReplayBuffer.__new__(RolloutReplayBuffer)
                 replay_buffer._rng = np.random.default_rng(2)
@@ -254,7 +264,7 @@ class TrainingCheckpointTest(unittest.TestCase):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "checkpoint_best.pt"
                 model = _Stateful()
-                trainer = SimpleNamespace(optimizer=_Stateful(), value_optimizer=_Stateful())
+                trainer = SimpleNamespace(optimizer=_Stateful())
                 replay_buffer = RolloutReplayBuffer.__new__(RolloutReplayBuffer)
                 replay_buffer._rng = np.random.default_rng(2)
                 module._save_checkpoint(
@@ -293,16 +303,12 @@ class TrainingCheckpointTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(model.loaded)
                 self.assertIsNotNone(trainer.optimizer.loaded)
-                self.assertIsNone(trainer.value_optimizer.loaded)
 
-    def test_pretraining_does_not_run_value_updates(self) -> None:
+    def test_pretraining_only_runs_replay_updates(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 output_dir = Path(directory)
-                trainer = SimpleNamespace(
-                    train_epoch=mock.Mock(return_value={"total": 1.0}),
-                    train_value_rollout=mock.Mock(),
-                )
+                trainer = SimpleNamespace(train_epoch=mock.Mock(return_value={"total": 1.0}))
                 replay_buffer = SimpleNamespace(batches=(object(),), num_stored=8)
                 args = SimpleNamespace(
                     resume=None,
@@ -347,16 +353,14 @@ class TrainingCheckpointTest(unittest.TestCase):
                     mock.ANY,
                     on_update=mock.ANY,
                 )
-                trainer.train_value_rollout.assert_not_called()
 
-    def test_formal_model_uses_pretrained_config_but_fresh_critics(self) -> None:
+    def test_formal_model_restores_complete_pretrained_world_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint_best.pt"
             source_config = trans_wm_le_train.WorldModelConfig(
                 observation_shape=(3, 32, 32),
                 action_shape=(1,),
                 cnn_channels=(4,),
-                num_critics=2,
             )
             target_config = trans_wm_le_train._model_config_from_checkpoint(
                 asdict(source_config),
@@ -390,10 +394,6 @@ class TrainingCheckpointTest(unittest.TestCase):
             target_trainer = trans_wm_le_train.WorldModelTrainer(
                 target_model, training_config
             )
-            critics_before = [
-                parameter.detach().clone()
-                for parameter in target_model.heads.value_head.parameters()
-            ]
             trans_wm_le_train._load_pretrained_checkpoint(
                 path,
                 target_model,
@@ -403,15 +403,10 @@ class TrainingCheckpointTest(unittest.TestCase):
                 torch.device("cpu"),
             )
 
-            self.assertEqual(len(target_model.heads.value_head.critics), 2)
             torch.testing.assert_close(
                 next(target_model.encoder.parameters()),
                 next(source_model.encoder.parameters()),
             )
-            for before, after in zip(
-                critics_before, target_model.heads.value_head.parameters(), strict=True
-            ):
-                torch.testing.assert_close(before, after, rtol=0.0, atol=0.0)
 
 
 if __name__ == "__main__":

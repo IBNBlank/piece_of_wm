@@ -22,8 +22,6 @@ class WorldModelConfig:
     feedforward_dim: int = 512
     cnn_channels: tuple[int, ...] = (32, 64, 128)
     dropout: float = 0.0
-    num_critics: int = 2
-    gamma: float = 0.99
     target_ema: float = 0.99
 
     def __post_init__(self) -> None:
@@ -43,14 +41,10 @@ class WorldModelConfig:
             raise ValueError("latent_dim is fixed at 64 for trans_wm_le.")
         if self.num_layers <= 0 or self.num_heads <= 0:
             raise ValueError("num_layers and num_heads must be positive.")
-        if self.num_critics <= 0:
-            raise ValueError("num_critics must be positive.")
         if self.model_dim % self.num_heads:
             raise ValueError("model_dim must be divisible by num_heads.")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
-        if not 0.0 <= self.gamma <= 1.0:
-            raise ValueError("gamma must be in [0, 1].")
         if not 0.0 <= self.target_ema < 1.0:
             raise ValueError("target_ema must be in [0, 1).")
 

@@ -16,13 +16,11 @@
 #   BATCH_SIZE          : sampled transitions per optimization batch (default: 32)
 #   REPLAY_CAPACITY     : rollout files held in RAM (default: complete dataset)
 #   SAMPLE_ROLLOUTS     : rollout batches combined per update (default: 2)
-#   VALUE_ROLLOUTS      : current-policy online episodes per update (default: 2)
-#   VALUE_EPOCHS        : value-only epochs per online episode (default: 1)
-#   LAMBDA_RETURN       : TD(lambda) mixing factor for value targets (default: 0.95)
-#   NUM_PARTICLES       : action particles per policy update (default: 100)
-#   PARTICLE_UPDATES    : particle resampling iterations (default: 4)
+#   NUM_PARTICLES       : action particles per policy update (default: 1000)
+#   PARTICLE_UPDATES    : particle resampling iterations (default: 5)
 #   PARTICLE_SIGMA      : particle perturbation standard deviation (default: 0.1)
-#   PLANNING_HORIZON    : model planning horizon (default: 1)
+#   PARTICLE_TEMPERATURE: softmax resampling temperature (default: 2.0)
+#   PLANNING_HORIZON    : WM training and policy planning horizon (default: 10)
 #   EVALUATION_ROLLOUTS : online evaluation episodes per checkpoint (default: 10)
 #   EPOCHS_PER_ROLLOUT  : optimization epochs for each rollout (default: 10)
 #   CHECKPOINT_ROLLOUTS : checkpoint frequency in rollouts (default: 10)
@@ -37,8 +35,6 @@
 #   FEEDFORWARD_DIM      : Transformer feedforward dimension (default: 512)
 #   CNN_CHANNELS         : comma-separated CNN channels (default: 32,64,128)
 #   DROPOUT              : Transformer dropout (default: 0.0)
-#   NUM_CRITICS          : value critic ensemble size (default: 2)
-#   GAMMA                : value and planning discount factor (default: 0.95)
 #   TARGET_EMA           : EMA target decay (default: 0.99)
 #   LEARNING_RATE        : AdamW learning rate (default: 1e-4)
 #   WEIGHT_DECAY         : AdamW weight decay (default: 1e-5)
@@ -71,16 +67,14 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/trans_wm}"
 NUM_ENVS="${NUM_ENVS:-10}"
 MAX_STEPS="${MAX_STEPS:-200}"
 ROLLOUTS="${ROLLOUTS:-500}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
 REPLAY_CAPACITY="${REPLAY_CAPACITY:-}"
 SAMPLE_ROLLOUTS="${SAMPLE_ROLLOUTS:-2}"
-VALUE_ROLLOUTS="${VALUE_ROLLOUTS:-2}"
-VALUE_EPOCHS="${VALUE_EPOCHS:-1}"
-LAMBDA_RETURN="${LAMBDA_RETURN:-0.95}"
-NUM_PARTICLES="${NUM_PARTICLES:-100}"
-PARTICLE_UPDATES="${PARTICLE_UPDATES:-4}"
+NUM_PARTICLES="${NUM_PARTICLES:-1000}"
+PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-1}"
+PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
 EVALUATION_ROLLOUTS="${EVALUATION_ROLLOUTS:-10}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-10}"
 CHECKPOINT_ROLLOUTS="${CHECKPOINT_ROLLOUTS:-10}"
@@ -95,8 +89,6 @@ NUM_HEADS="${NUM_HEADS:-4}"
 FEEDFORWARD_DIM="${FEEDFORWARD_DIM:-512}"
 CNN_CHANNELS="${CNN_CHANNELS:-32,64,128}"
 DROPOUT="${DROPOUT:-0.0}"
-NUM_CRITICS="${NUM_CRITICS:-2}"
-GAMMA="${GAMMA:-0.95}"
 TARGET_EMA="${TARGET_EMA:-0.99}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
@@ -120,12 +112,10 @@ args=(
 	--rollouts "${ROLLOUTS}"
 	--batch-size "${BATCH_SIZE}"
 	--sample-rollouts "${SAMPLE_ROLLOUTS}"
-	--value-rollouts "${VALUE_ROLLOUTS}"
-	--value-epochs "${VALUE_EPOCHS}"
-	--lambda-return "${LAMBDA_RETURN}"
 	--num-particles "${NUM_PARTICLES}"
 	--particle-updates "${PARTICLE_UPDATES}"
 	--particle-sigma "${PARTICLE_SIGMA}"
+	--particle-temperature "${PARTICLE_TEMPERATURE}"
 	--planning-horizon "${PLANNING_HORIZON}"
 	--evaluation-rollouts "${EVALUATION_ROLLOUTS}"
 	--epochs-per-rollout "${EPOCHS_PER_ROLLOUT}"
@@ -138,8 +128,6 @@ args=(
 	--feedforward-dim "${FEEDFORWARD_DIM}"
 	--cnn-channels "${CNN_CHANNELS}"
 	--dropout "${DROPOUT}"
-	--num-critics "${NUM_CRITICS}"
-	--gamma "${GAMMA}"
 	--target-ema "${TARGET_EMA}"
 	--learning-rate "${LEARNING_RATE}"
 	--weight-decay "${WEIGHT_DECAY}"
@@ -161,7 +149,7 @@ if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
 fi
 
 echo "[run_train_trans_wm] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
-echo "[run_train_trans_wm] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} value_rollouts=${VALUE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} gamma=${GAMMA} lambda=${LAMBDA_RETURN} critics=${NUM_CRITICS} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
+echo "[run_train_trans_wm] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
 echo "[run_train_trans_wm] latent_dim=${LATENT_DIM} model_dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS}"
 
 # shellcheck disable=SC2086

@@ -8,15 +8,18 @@ import torch
 PENDULUM_ACTION_DIM = 1
 PENDULUM_ACTION_LOW = -2.0
 PENDULUM_ACTION_HIGH = 2.0
-NUM_ACTION_PARTICLES = 100
+PENDULUM_ACTION_MIDPOINT = (PENDULUM_ACTION_LOW + PENDULUM_ACTION_HIGH) / 2.0
+INITIAL_PARTICLE_SIGMA = (PENDULUM_ACTION_HIGH - PENDULUM_ACTION_LOW) / 4.0
+NUM_ACTION_PARTICLES = 1000
 DEFAULT_PARTICLE_SIGMA = 0.1
+DEFAULT_PARTICLE_TEMPERATURE = 2.0
 
 
 class ParticlePolicy:
     """Generates and updates batches of one-dimensional Pendulum action particles.
 
     The policy has no world-model dependency. Callers evaluate particles with their
-    own reward and value models, then pass those scores to :meth:`update_particles`.
+    own reward model, then pass those scores to :meth:`update_particles`.
     """
 
     def __init__(self, num_particles: int = NUM_ACTION_PARTICLES, horizon: int = 1) -> None:
@@ -39,17 +42,18 @@ class ParticlePolicy:
         dtype: torch.dtype = torch.float32,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """Returns uniformly sampled particles for each batch element."""
+        """Samples bounded Gaussian action sequences independently at every step."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         if not torch.empty((), dtype=dtype).is_floating_point():
             raise TypeError("Particle dtype must be floating point.")
-        return PENDULUM_ACTION_LOW + (PENDULUM_ACTION_HIGH - PENDULUM_ACTION_LOW) * torch.rand(
+        particles = PENDULUM_ACTION_MIDPOINT + INITIAL_PARTICLE_SIGMA * torch.randn(
             (batch_size, self.num_particles, self.horizon, PENDULUM_ACTION_DIM),
             dtype=dtype,
             device=device,
             generator=generator,
         )
+        return particles.clamp(PENDULUM_ACTION_LOW, PENDULUM_ACTION_HIGH)
 
     def update_particles(
         self,
@@ -57,22 +61,25 @@ class ParticlePolicy:
         scores: torch.Tensor,
         *,
         sigma: float | None = None,
+        temperature: float = DEFAULT_PARTICLE_TEMPERATURE,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Resamples particles by score and perturbs each result with Gaussian noise.
 
         ``scores`` has shape ``(batch, num_particles)`` and is converted to resampling weights
-        with ``softmax``. ``sigma`` is the Gaussian standard deviation; omitting it
-        uses ``0.1``.
+        with ``softmax(scores / temperature)``. ``sigma`` is the Gaussian standard
+        deviation; omitting it uses ``0.1``.
         """
         self._validate_particles(particles)
         self._validate_scores(scores, particles)
         sigma = DEFAULT_PARTICLE_SIGMA if sigma is None else sigma
         if sigma < 0.0:
             raise ValueError("sigma must be non-negative.")
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive.")
 
         parent_indices = torch.multinomial(
-            torch.softmax(scores, dim=1),
+            torch.softmax(scores / temperature, dim=1),
             self.num_particles,
             replacement=True,
             generator=generator,

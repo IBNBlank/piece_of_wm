@@ -5,7 +5,7 @@
 # Usage:
 #   ./run_train_trans_wm_le.sh
 #   ROLLOUTS=500 BATCH_SIZE=16 DEVICE=cuda ./run_train_trans_wm_le.sh
-#   JEPA_WEIGHT=1.0 SIGREG_WEIGHT=0.1 ./run_train_trans_wm_le.sh
+#   JEPA_WEIGHT=1.0 SIGREG_WEIGHT=0.2 ./run_train_trans_wm_le.sh
 #
 # Tunables (env vars):
 #   PYTHON                : Python interpreter
@@ -17,13 +17,11 @@
 #   BATCH_SIZE            : sampled transitions per optimization batch (default: 128)
 #   REPLAY_CAPACITY       : rollout files held in RAM (default: complete dataset)
 #   SAMPLE_ROLLOUTS       : rollout batches combined per update (default: 2)
-#   VALUE_ROLLOUTS        : current-policy online episodes per update (default: 2)
-#   VALUE_EPOCHS          : value-only epochs per online episode (default: 4)
-#   LAMBDA_RETURN         : TD(lambda) mixing factor for value targets (default: 0.95)
-#   NUM_PARTICLES         : action particles per policy update (default: 100)
-#   PARTICLE_UPDATES      : particle resampling iterations (default: 4)
+#   NUM_PARTICLES         : action particles per policy update (default: 1000)
+#   PARTICLE_UPDATES      : particle resampling iterations (default: 5)
 #   PARTICLE_SIGMA        : particle perturbation standard deviation (default: 0.1)
-#   PLANNING_HORIZON      : model planning horizon (default: 3)
+#   PARTICLE_TEMPERATURE  : softmax resampling temperature (default: 2.0)
+#   PLANNING_HORIZON      : WM training and policy planning horizon (default: 10)
 #   EVALUATION_ROLLOUTS   : online evaluation episodes per checkpoint (default: 10)
 #   EPOCHS_PER_ROLLOUT    : optimization epochs for each rollout (default: 10)
 #   CHECKPOINT_ROLLOUTS   : checkpoint frequency in rollouts (default: 10)
@@ -36,7 +34,7 @@
 #   WEIGHT_DECAY          : AdamW weight decay (default: 1e-5)
 #   GRAD_CLIP_NORM        : gradient clipping norm (default: 10.0)
 #   JEPA_WEIGHT           : JEPA latent prediction loss weight (default: 1.0)
-#   SIGREG_WEIGHT         : SIGReg regularization weight (default: 1.0)
+#   SIGREG_WEIGHT         : SIGReg regularization weight (default: 0.2)
 #   SIGREG_PROJECTIONS    : random SIGReg projections (default: 256)
 #   SIGREG_FREQUENCIES    : frequencies per SIGReg projection (default: 17)
 #   SIGREG_MAX_FREQUENCY  : maximum SIGReg frequency (default: 5.0)
@@ -66,16 +64,14 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/trans_wm_le}"
 NUM_ENVS="${NUM_ENVS:-20}"
 MAX_STEPS="${MAX_STEPS:-200}"
 ROLLOUTS="${ROLLOUTS:-500}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
 REPLAY_CAPACITY="${REPLAY_CAPACITY:-}"
 SAMPLE_ROLLOUTS="${SAMPLE_ROLLOUTS:-2}"
-VALUE_ROLLOUTS="${VALUE_ROLLOUTS:-2}"
-VALUE_EPOCHS="${VALUE_EPOCHS:-4}"
-LAMBDA_RETURN="${LAMBDA_RETURN:-0.95}"
-NUM_PARTICLES="${NUM_PARTICLES:-100}"
-PARTICLE_UPDATES="${PARTICLE_UPDATES:-4}"
+NUM_PARTICLES="${NUM_PARTICLES:-1000}"
+PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-3}"
+PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
 EVALUATION_ROLLOUTS="${EVALUATION_ROLLOUTS:-10}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-10}"
 CHECKPOINT_ROLLOUTS="${CHECKPOINT_ROLLOUTS:-10}"
@@ -91,7 +87,7 @@ LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-10.0}"
 JEPA_WEIGHT="${JEPA_WEIGHT:-1.0}"
-SIGREG_WEIGHT="${SIGREG_WEIGHT:-1.0}"
+SIGREG_WEIGHT="${SIGREG_WEIGHT:-0.2}"
 SIGREG_PROJECTIONS="${SIGREG_PROJECTIONS:-256}"
 SIGREG_FREQUENCIES="${SIGREG_FREQUENCIES:-17}"
 SIGREG_MAX_FREQUENCY="${SIGREG_MAX_FREQUENCY:-5.0}"
@@ -112,12 +108,10 @@ args=(
 	--rollouts "${ROLLOUTS}"
 	--batch-size "${BATCH_SIZE}"
 	--sample-rollouts "${SAMPLE_ROLLOUTS}"
-	--value-rollouts "${VALUE_ROLLOUTS}"
-	--value-epochs "${VALUE_EPOCHS}"
-	--lambda-return "${LAMBDA_RETURN}"
 	--num-particles "${NUM_PARTICLES}"
 	--particle-updates "${PARTICLE_UPDATES}"
 	--particle-sigma "${PARTICLE_SIGMA}"
+	--particle-temperature "${PARTICLE_TEMPERATURE}"
 	--planning-horizon "${PLANNING_HORIZON}"
 	--evaluation-rollouts "${EVALUATION_ROLLOUTS}"
 	--epochs-per-rollout "${EPOCHS_PER_ROLLOUT}"
@@ -147,7 +141,7 @@ fi
 
 echo "[run_train_trans_wm_le] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
 echo "[run_train_trans_wm_le] pretrained_checkpoint=${PRETRAINED_CHECKPOINT:-none}"
-echo "[run_train_trans_wm_le] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} value_rollouts=${VALUE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} lambda=${LAMBDA_RETURN} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
+echo "[run_train_trans_wm_le] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
 echo "[run_train_trans_wm_le] jepa_weight=${JEPA_WEIGHT} sigreg_weight=${SIGREG_WEIGHT}"
 
 # shellcheck disable=SC2086

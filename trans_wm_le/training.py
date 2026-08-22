@@ -13,7 +13,6 @@ from trans_wm_le.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN
 from trans_wm_le.history import append_history, history_windows, previous_history_windows
 from trans_wm_le.model import WorldModel
 from utils.replay_buffer import EpisodeBatch, RolloutReplayBuffer
-from utils.value import discounted_returns
 
 
 @dataclass(frozen=True)
@@ -22,25 +21,26 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     grad_clip_norm: float | None = 100.0
     jepa_weight: float = 1.0
-    sigreg_weight: float = 1.0
+    sigreg_weight: float = 0.2
     reward_weight: float = 1.0
-    value_weight: float = 1.0
     sigreg_projections: int = 256
     sigreg_frequencies: int = 17
     sigreg_max_frequency: float = 5.0
+    planning_horizon: int = 10
 
     def __post_init__(self) -> None:
         if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
             raise ValueError("learning_rate must be positive and weight_decay non-negative.")
         if self.grad_clip_norm is not None and self.grad_clip_norm <= 0.0:
             raise ValueError("grad_clip_norm must be positive when provided.")
+        if self.planning_horizon <= 0:
+            raise ValueError("planning_horizon must be positive.")
         if any(
             weight < 0.0
             for weight in (
                 self.jepa_weight,
                 self.sigreg_weight,
                 self.reward_weight,
-                self.value_weight,
             )
         ):
             raise ValueError("Loss weights must be non-negative.")
@@ -62,15 +62,58 @@ class TensorEpisodeBatch:
 
 @dataclass(frozen=True)
 class TensorTransitionBatch:
-    current_observations: torch.Tensor  # [B, 10, C, H, W]
-    next_observations: torch.Tensor  # [B, 10, C, H, W]
-    current_obs_valid: torch.Tensor  # [B, 10]
-    next_obs_valid: torch.Tensor  # [B, 10]
+    observations: torch.Tensor  # [B, 10 + P, C, H, W]
+    obs_valid: torch.Tensor  # [B, 10 + P]
     action_history: torch.Tensor  # [B, 9, action_dim]
     action_valid: torch.Tensor  # [B, 9]
-    action: torch.Tensor  # [B, action_dim]
-    reward: torch.Tensor  # [B, 1]
-    terminated: torch.Tensor  # [B, 1]
+    actions: torch.Tensor  # [B, P, action_dim]
+    rewards: torch.Tensor  # [B, P, 1]
+    terminated: torch.Tensor  # [B, P]
+    transition_valid: torch.Tensor  # [B, P]
+
+    @property
+    def current_observations(self) -> torch.Tensor:
+        return self.observations[:, :OBS_HISTORY_LEN]
+
+    @property
+    def current_obs_valid(self) -> torch.Tensor:
+        return self.obs_valid[:, :OBS_HISTORY_LEN]
+
+    @property
+    def target_observations(self) -> torch.Tensor:
+        return torch.stack(
+            [
+                self.observations[:, offset + 1 : offset + 1 + OBS_HISTORY_LEN]
+                for offset in range(self.actions.shape[1])
+            ],
+            dim=1,
+        )
+
+    @property
+    def target_obs_valid(self) -> torch.Tensor:
+        return torch.stack(
+            [
+                self.obs_valid[:, offset + 1 : offset + 1 + OBS_HISTORY_LEN]
+                for offset in range(self.actions.shape[1])
+            ],
+            dim=1,
+        )
+
+    @property
+    def next_observations(self) -> torch.Tensor:
+        return self.observations[:, 1 : 1 + OBS_HISTORY_LEN]
+
+    @property
+    def next_obs_valid(self) -> torch.Tensor:
+        return self.obs_valid[:, 1 : 1 + OBS_HISTORY_LEN]
+
+    @property
+    def action(self) -> torch.Tensor:
+        return self.actions[:, 0]
+
+    @property
+    def reward(self) -> torch.Tensor:
+        return self.rewards[:, 0]
 
 
 @dataclass(frozen=True)
@@ -79,7 +122,6 @@ class WorldModelLosses:
     jepa: torch.Tensor
     sigreg: torch.Tensor
     reward: torch.Tensor
-    value: torch.Tensor
 
     def detached(self) -> dict[str, float]:
         return {
@@ -87,7 +129,6 @@ class WorldModelLosses:
             "jepa": self.jepa.detach().item(),
             "sigreg": self.sigreg.detach().item(),
             "reward": self.reward.detach().item(),
-            "value": self.value.detach().item(),
         }
 
 
@@ -116,18 +157,22 @@ def sample_transition_batch(
     model: WorldModel,
     batch_size: int,
     rng: np.random.Generator,
+    planning_horizon: int,
 ) -> TensorTransitionBatch:
     """Samples transitions with their exact image and preceding-action histories."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     flat_indices = rng.integers(0, batch.num_transitions, size=batch_size)
-    return transition_batch_from_indices(batch, model, flat_indices)
+    return transition_batch_from_indices(
+        batch, model, flat_indices, planning_horizon=planning_horizon
+    )
 
 
 def transition_batch_from_indices(
     batch: EpisodeBatch,
     model: WorldModel,
     flat_indices: np.ndarray,
+    planning_horizon: int,
 ) -> TensorTransitionBatch:
     """Builds an aligned transition batch from flattened episode indices."""
     source = batch.images if batch.images is not None else batch.obs
@@ -136,6 +181,8 @@ def transition_batch_from_indices(
     flat_indices = np.asarray(flat_indices, dtype=np.int64)
     if flat_indices.ndim != 1 or len(flat_indices) == 0:
         raise ValueError("flat_indices must be a non-empty one-dimensional array.")
+    if planning_horizon <= 0:
+        raise ValueError("planning_horizon must be positive.")
     lengths = np.asarray(batch.lengths, dtype=np.int64)
     cumulative = np.cumsum(lengths)
     if np.any(flat_indices < 0) or np.any(flat_indices >= cumulative[-1]):
@@ -145,53 +192,58 @@ def transition_batch_from_indices(
     starts = np.concatenate((np.zeros(1, dtype=np.int64), cumulative[:-1]))
     time_indices = flat_indices - starts[episode_indices]
 
-    current_observations = np.zeros(
-        (batch_size, OBS_HISTORY_LEN, *source.shape[2:]), dtype=source.dtype
+    observations = np.zeros(
+        (batch_size, OBS_HISTORY_LEN + planning_horizon, *source.shape[2:]),
+        dtype=source.dtype,
     )
-    next_observations = np.zeros_like(current_observations)
-    current_obs_valid = np.zeros((batch_size, OBS_HISTORY_LEN), dtype=bool)
-    next_obs_valid = np.zeros_like(current_obs_valid)
+    obs_valid = np.zeros((batch_size, OBS_HISTORY_LEN + planning_horizon), dtype=bool)
     action_shape = batch.action.shape[2:]
     action_history = np.zeros(
         (batch_size, ACTION_HISTORY_LEN, *action_shape), dtype=batch.action.dtype
     )
     action_valid = np.zeros((batch_size, ACTION_HISTORY_LEN), dtype=bool)
-    actions = np.empty((batch_size, *action_shape), dtype=batch.action.dtype)
-    rewards = np.empty((batch_size, 1), dtype=batch.reward.dtype)
-    terminated = np.empty((batch_size, 1), dtype=bool)
+    actions = np.zeros(
+        (batch_size, planning_horizon, *action_shape), dtype=batch.action.dtype
+    )
+    rewards = np.zeros((batch_size, planning_horizon, 1), dtype=batch.reward.dtype)
+    terminated = np.zeros((batch_size, planning_horizon), dtype=bool)
+    transition_valid = np.zeros((batch_size, planning_horizon), dtype=bool)
 
     for sample, (episode, timestep) in enumerate(zip(episode_indices, time_indices, strict=True)):
-        current_start = max(0, int(timestep) - OBS_HISTORY_LEN + 1)
-        current = source[episode, current_start : timestep + 1]
-        current_observations[sample, -len(current) :] = current
-        current_obs_valid[sample, -len(current) :] = True
-
-        next_start = max(0, int(timestep) - OBS_HISTORY_LEN + 2)
-        following = source[episode, next_start : timestep + 2]
-        next_observations[sample, -len(following) :] = following
-        next_obs_valid[sample, -len(following) :] = True
+        sequence_start = int(timestep) - OBS_HISTORY_LEN + 1
+        source_start = max(0, sequence_start)
+        source_end = min(int(lengths[episode]) + 1, int(timestep) + planning_horizon + 1)
+        destination_start = source_start - sequence_start
+        sequence = source[episode, source_start:source_end]
+        observations[
+            sample, destination_start : destination_start + len(sequence)
+        ] = sequence
+        obs_valid[sample, destination_start : destination_start + len(sequence)] = True
 
         action_start = max(0, int(timestep) - ACTION_HISTORY_LEN)
         previous_actions = batch.action[episode, action_start:timestep]
         if len(previous_actions):
             action_history[sample, -len(previous_actions) :] = previous_actions
             action_valid[sample, -len(previous_actions) :] = True
-        actions[sample] = batch.action[episode, timestep]
-        rewards[sample, 0] = batch.reward[episode, timestep]
-        terminated[sample, 0] = batch.terminated[episode, timestep]
+        rollout_length = min(planning_horizon, int(lengths[episode] - timestep))
+        for offset in range(rollout_length):
+            transition = int(timestep + offset)
+            actions[sample, offset] = batch.action[episode, transition]
+            rewards[sample, offset, 0] = batch.reward[episode, transition]
+            terminated[sample, offset] = batch.terminated[episode, transition]
+            transition_valid[sample, offset] = True
 
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
     return TensorTransitionBatch(
-        _image_tensor(current_observations, model.config.observation_shape, device, dtype),
-        _image_tensor(next_observations, model.config.observation_shape, device, dtype),
-        torch.as_tensor(current_obs_valid, device=device),
-        torch.as_tensor(next_obs_valid, device=device),
+        _image_tensor(observations, model.config.observation_shape, device, dtype),
+        torch.as_tensor(obs_valid, device=device),
         torch.as_tensor(action_history, device=device, dtype=dtype).flatten(start_dim=2),
         torch.as_tensor(action_valid, device=device),
-        torch.as_tensor(actions, device=device, dtype=dtype).flatten(start_dim=1),
+        torch.as_tensor(actions, device=device, dtype=dtype).flatten(start_dim=2),
         torch.as_tensor(rewards, device=device, dtype=dtype),
         torch.as_tensor(terminated, device=device),
+        torch.as_tensor(transition_valid, device=device),
     )
 
 
@@ -273,27 +325,46 @@ def world_model_loss(
         action_windows.flatten(0, 1),
         action_masks.flatten(0, 1),
     ).reshape(batch_size, states, model.config.latent_dim)
-    current_z = online_latents[:, :-1].flatten(0, 1)
-    predicted_next_z = model.predict_next_online(current_z, batch.actions.flatten(0, 1))
-    reward_target = batch.rewards.flatten(0, 1)
-
     with torch.no_grad():
-        target_next_z = model.encode_ema(
-            obs_windows[:, 1:].flatten(0, 1),
-            obs_masks[:, 1:].flatten(0, 1),
-            action_windows[:, 1:].flatten(0, 1),
-            action_masks[:, 1:].flatten(0, 1),
-        )
+        target_latents = model.encode_ema(
+            obs_windows.flatten(0, 1),
+            obs_masks.flatten(0, 1),
+            action_windows.flatten(0, 1),
+            action_masks.flatten(0, 1),
+        ).reshape(batch_size, states, model.config.latent_dim)
 
-    valid = batch.transition_valid.flatten().to(dtype=current_z.dtype)
-    jepa = _masked_mean((predicted_next_z - target_next_z).square().mean(dim=-1), valid)
-    reward = _masked_mean(
-        (model.heads.reward(current_z, batch.actions.flatten(0, 1)) - reward_target)
-        .square()
-        .squeeze(-1),
-        valid,
+    rollout_z = online_latents[:, :-1]
+    jepa_errors = []
+    reward_errors = []
+    rollout_valid = []
+    rollout_steps = min(config.planning_horizon, batch.actions.shape[1])
+    for offset in range(rollout_steps):
+        step_actions = batch.actions[:, offset:]
+        step_valid = batch.transition_valid[:, offset:]
+        predicted_reward = model.heads.reward(
+            rollout_z.flatten(0, 1), step_actions.flatten(0, 1)
+        ).reshape(*step_actions.shape[:2], 1)
+        predicted_next_z = model.predict_next_online(
+            rollout_z.flatten(0, 1), step_actions.flatten(0, 1)
+        ).reshape(*step_actions.shape[:2], model.config.latent_dim)
+        jepa_errors.append(
+            (predicted_next_z - target_latents[:, offset + 1 :]).square().mean(dim=-1)
+        )
+        reward_errors.append(
+            (predicted_reward - batch.rewards[:, offset:]).square().squeeze(-1)
+        )
+        rollout_valid.append(step_valid)
+        rollout_z = predicted_next_z[:, :-1]
+
+    valid = torch.cat([item.flatten() for item in rollout_valid]).to(
+        dtype=online_latents.dtype
     )
-    value = reward.new_zeros(())
+    jepa = _masked_mean(
+        torch.cat([item.flatten() for item in jepa_errors]), valid
+    )
+    reward = _masked_mean(
+        torch.cat([item.flatten() for item in reward_errors]), valid
+    )
     sigreg = sigreg_loss(
         online_latents[batch.state_valid],
         config.sigreg_projections,
@@ -305,7 +376,7 @@ def world_model_loss(
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
     )
-    return WorldModelLosses(total, jepa, sigreg, reward, value)
+    return WorldModelLosses(total, jepa, sigreg, reward)
 
 
 def transition_world_model_loss(
@@ -319,57 +390,82 @@ def transition_world_model_loss(
         batch.action_history,
         batch.action_valid,
     )
-    next_action_history, next_action_valid = append_history(
-        batch.action_history, batch.action_valid, batch.action
-    )
-    next_z = model.encode_online(
-        batch.next_observations,
-        batch.next_obs_valid,
-        next_action_history,
-        next_action_valid,
-    )
-    predicted_next_z = model.predict_next_online(current_z, batch.action)
-    with torch.no_grad():
-        target_next_z = model.encode_ema(
-            batch.next_observations,
-            batch.next_obs_valid,
-            next_action_history,
-            next_action_valid,
+    target_histories = []
+    target_history_valid = []
+    action_history = batch.action_history
+    action_valid = batch.action_valid
+    for offset in range(batch.actions.shape[1]):
+        action_history, action_valid = append_history(
+            action_history, action_valid, batch.actions[:, offset]
         )
+        target_histories.append(action_history)
+        target_history_valid.append(action_valid)
+    target_online_latents = []
+    target_latents = []
+    for offset, (target_history, target_valid) in enumerate(
+        zip(target_histories, target_history_valid, strict=True)
+    ):
+        target_observation = batch.observations[
+            :, offset + 1 : offset + 1 + OBS_HISTORY_LEN
+        ]
+        target_obs_valid = batch.obs_valid[
+            :, offset + 1 : offset + 1 + OBS_HISTORY_LEN
+        ]
+        target_online_latents.append(
+            model.encode_online(
+                target_observation,
+                target_obs_valid,
+                target_history,
+                target_valid,
+            )
+        )
+        with torch.no_grad():
+            target_latents.append(
+                model.encode_ema(
+                    target_observation,
+                    target_obs_valid,
+                    target_history,
+                    target_valid,
+                )
+            )
+    target_online_z = torch.stack(target_online_latents, dim=1)
+    target_z = torch.stack(target_latents, dim=1)
 
-    jepa = (predicted_next_z - target_next_z).square().mean()
+    rollout_z = current_z
+    jepa_errors = []
+    reward_errors = []
+    for offset in range(batch.actions.shape[1]):
+        action = batch.actions[:, offset]
+        reward_errors.append(
+            (model.heads.reward(rollout_z, action) - batch.rewards[:, offset])
+            .square()
+            .squeeze(-1)
+        )
+        rollout_z = model.predict_next_online(rollout_z, action)
+        jepa_errors.append((rollout_z - target_z[:, offset]).square().mean(dim=-1))
+    valid = batch.transition_valid.flatten().to(dtype=current_z.dtype)
+    jepa = _masked_mean(torch.stack(jepa_errors, dim=1).flatten(), valid)
     sigreg = sigreg_loss(
-        torch.cat((current_z, next_z), dim=0),
+        torch.cat((current_z, target_online_z[batch.transition_valid]), dim=0),
         config.sigreg_projections,
         config.sigreg_frequencies,
         config.sigreg_max_frequency,
     )
-    reward = (model.heads.reward(current_z, batch.action) - batch.reward).square().mean()
-    value = reward.new_zeros(())
+    reward = _masked_mean(torch.stack(reward_errors, dim=1).flatten(), valid)
     total = (
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
     )
-    return WorldModelLosses(total, jepa, sigreg, reward, value)
+    return WorldModelLosses(total, jepa, sigreg, reward)
 
 
 class WorldModelTrainer:
     def __init__(self, model: WorldModel, config: TrainingConfig | None = None) -> None:
         self.model = model
         self.config = config or TrainingConfig()
-        value_parameters = set(model.heads.value_head.parameters())
         self.optimizer = torch.optim.AdamW(
-            (
-                parameter
-                for parameter in model.parameters()
-                if parameter.requires_grad and parameter not in value_parameters
-            ),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
-        self.value_optimizer = torch.optim.AdamW(
-            model.heads.value_head.parameters(),
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
@@ -390,7 +486,13 @@ class WorldModelTrainer:
         rng: np.random.Generator,
     ) -> dict[str, float]:
         self.model.train()
-        sampled = sample_transition_batch(batch, self.model, batch_size, rng)
+        sampled = sample_transition_batch(
+            batch,
+            self.model,
+            batch_size,
+            rng,
+            planning_horizon=self.config.planning_horizon,
+        )
         self.optimizer.zero_grad(set_to_none=True)
         losses = transition_world_model_loss(self.model, sampled, self.config)
         losses.total.backward()
@@ -422,6 +524,7 @@ class WorldModelTrainer:
                     batches[int(batch_index)],
                     self.model,
                     minibatch_indices[batch_indices == batch_index] - starts[batch_index],
+                    planning_horizon=self.config.planning_horizon,
                 )
                 for batch_index in np.unique(batch_indices)
             ]
@@ -457,7 +560,10 @@ class WorldModelTrainer:
             for start in range(0, len(indices), batch_size):
                 minibatch_indices = indices[start : start + batch_size]
                 sampled = transition_batch_from_indices(
-                    batch, self.model, minibatch_indices
+                    batch,
+                    self.model,
+                    minibatch_indices,
+                    planning_horizon=self.config.planning_horizon,
                 )
                 metrics = transition_world_model_loss(
                     self.model, sampled, self.config
@@ -467,28 +573,6 @@ class WorldModelTrainer:
                 for name, value in metrics.items():
                     totals[name] = totals.get(name, 0.0) + value * count
         return {name: value / num_transitions for name, value in totals.items()}
-
-    def train_value_rollout(
-        self, latents: torch.Tensor, returns: torch.Tensor
-    ) -> dict[str, float]:
-        """Fits every online critic to aligned value targets from a real rollout."""
-        if latents.ndim != 2 or latents.shape[1] != self.model.config.latent_dim:
-            raise ValueError("latents must have shape [time, latent_dim].")
-        returns = returns.reshape(-1, 1)
-        if returns.shape[0] != latents.shape[0]:
-            raise ValueError("latents and returns must have the same time dimension.")
-        self.model.train()
-        self.value_optimizer.zero_grad(set_to_none=True)
-        prediction = self.model.heads.value_head.minimum(latents.detach())
-        loss = (prediction - returns.detach()).square().mean()
-        (self.config.value_weight * loss).backward()
-        if self.config.grad_clip_norm is not None:
-            nn.utils.clip_grad_norm_(
-                self.model.heads.value_head.parameters(), self.config.grad_clip_norm
-            )
-        self.value_optimizer.step()
-        self.model.update_target()
-        return {"value": loss.detach().item()}
 
     def _finish_step(self) -> None:
         if self.config.grad_clip_norm is not None:

@@ -27,11 +27,10 @@ from utils.common import configure_logging, seed_everything
 from utils.env import make_env
 from utils.particle_policy import ParticlePolicy
 from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutReplayBuffer
-from utils.value import lambda_returns
 
 
 LOGGER = logging.getLogger("piece_of_wm.trans_wm_le")
-ARCHITECTURE_VERSION = 4
+ARCHITECTURE_VERSION = 5
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
@@ -73,13 +72,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-rollouts", type=int, default=2)
     parser.add_argument("--env-id", default="Pendulum-v1")
-    parser.add_argument("--value-rollouts", type=int, default=2)
-    parser.add_argument("--value-epochs", type=int, default=1)
-    parser.add_argument("--lambda-return", type=float, default=0.95)
-    parser.add_argument("--num-particles", type=int, default=100)
-    parser.add_argument("--particle-updates", type=int, default=4)
+    parser.add_argument("--num-particles", type=int, default=1000)
+    parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
-    parser.add_argument("--planning-horizon", type=int, default=1)
+    parser.add_argument("--particle-temperature", type=float, default=2.0)
+    parser.add_argument("--planning-horizon", type=int, default=10)
     parser.add_argument("--evaluation-rollouts", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10, help="Offline pretraining epochs.")
     parser.add_argument(
@@ -96,16 +93,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--pretrained-checkpoint", type=Path, default=None)
     parser.add_argument("--pretrain", action="store_true", help="Train only the world model.")
-    parser.add_argument(
-        "--num-critics", type=int, default=2, help="Critics recorded in pretraining config."
-    )
-    parser.add_argument("--gamma", type=float, default=0.95)
     parser.add_argument("--target-ema", type=float, default=0.99)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
     parser.add_argument("--jepa-weight", type=float, default=1.0)
-    parser.add_argument("--sigreg-weight", type=float, default=1.0)
+    parser.add_argument("--sigreg-weight", type=float, default=0.2)
     parser.add_argument("--sigreg-projections", type=int, default=256)
     parser.add_argument("--sigreg-frequencies", type=int, default=17)
     parser.add_argument("--sigreg-max-frequency", type=float, default=5.0)
@@ -149,8 +142,6 @@ def main() -> None:
         model_config = WorldModelConfig(
             observation_shape=observation_shape,
             action_shape=action_shape,
-            num_critics=args.num_critics,
-            gamma=args.gamma,
             target_ema=args.target_ema,
         )
     training_config = TrainingConfig(
@@ -162,6 +153,7 @@ def main() -> None:
         sigreg_projections=args.sigreg_projections,
         sigreg_frequencies=args.sigreg_frequencies,
         sigreg_max_frequency=args.sigreg_max_frequency,
+        planning_horizon=args.planning_horizon,
     )
     model = WorldModel(model_config).to(device)
     trainer = WorldModelTrainer(model, training_config)
@@ -210,7 +202,7 @@ def main() -> None:
     policy = ParticlePolicy(
         num_particles=args.num_particles, horizon=args.planning_horizon
     )
-    value_env = make_env(args.env_id, render_mode="rgb_array")
+    eval_env = make_env(args.env_id, render_mode="rgb_array")
     start_rollout = 0
     best_online_return = -float("inf")
     if args.resume is not None:
@@ -249,7 +241,7 @@ def main() -> None:
     )
     latest_checkpoint: Path | None = None
     with ExitStack() as stack:
-        stack.callback(value_env.close)
+        stack.callback(eval_env.close)
         stack.callback(progress.close)
         stack.enter_context(logging_redirect_tqdm())
         for rollout_index in progress:
@@ -257,28 +249,6 @@ def main() -> None:
             metrics = {}
             for _ in range(args.epochs_per_rollout):
                 metrics = trainer.train_transitions(current_batch, args.batch_size, rng)
-            value_losses = []
-            online_returns = []
-            for value_rollout in range(args.value_rollouts):
-                online = run_online_episode(
-                    "trans_wm_le", model, value_env, policy, args.max_steps,
-                    args.particle_updates, args.particle_sigma,
-                    args.seed + rollout_index * args.value_rollouts + value_rollout,
-                    policy_generator, record_frames=False, return_training_data=True,
-                )
-                targets = lambda_returns(
-                    online["rewards"],
-                    online["bootstrap_values"],
-                    model.config.gamma,
-                    args.lambda_return,
-                )
-                value_metrics = {}
-                for _ in range(args.value_epochs):
-                    value_metrics = trainer.train_value_rollout(online["latents"], targets)
-                value_losses.append(value_metrics["value"])
-                online_returns.append(online["return"])
-            metrics["value"] = float(np.mean(value_losses))
-            metrics["value_return"] = float(np.mean(online_returns))
             record = {
                 "rollout": rollout_index,
                 "sample_rollouts": args.sample_rollouts,
@@ -286,8 +256,6 @@ def main() -> None:
             }
             progress.set_postfix(
                 total=f"{metrics['total']:.4f}",
-                value=f"{metrics['value']:.4f}",
-                value_return=f"{metrics['value_return']:.2f}",
             )
             is_best = False
             should_evaluate = (
@@ -302,7 +270,7 @@ def main() -> None:
                     "trans_wm_le",
                     model,
                     rollout_index,
-                    value_env,
+                    eval_env,
                     policy,
                     args,
                     evaluation_generator,
@@ -441,14 +409,11 @@ def _validate_positive_args(args: argparse.Namespace) -> None:
         "batch_size",
         "sample_rollouts",
         "num_particles",
-        "num_critics",
         "evaluation_rollouts",
         "epochs",
         "checkpoint_epochs",
         "epochs_per_rollout",
         "checkpoint_rollouts",
-        "value_rollouts",
-        "value_epochs",
         "particle_updates",
         "planning_horizon",
     ):
@@ -458,8 +423,8 @@ def _validate_positive_args(args: argparse.Namespace) -> None:
         raise ValueError("--replay-capacity must be positive when provided.")
     if args.particle_sigma < 0.0:
         raise ValueError("--particle-sigma must be non-negative.")
-    if not 0.0 <= args.lambda_return <= 1.0:
-        raise ValueError("--lambda-return must be in [0, 1].")
+    if args.particle_temperature <= 0.0:
+        raise ValueError("--particle-temperature must be positive.")
 
 
 def _write_config(
@@ -482,13 +447,10 @@ def _write_config(
         "batch_size": args.batch_size,
         "replay_capacity": replay_rollouts,
         "env_id": args.env_id,
-        "value_rollouts": args.value_rollouts,
-        "value_epochs": args.value_epochs,
-        "lambda_return": args.lambda_return,
         "num_particles": args.num_particles,
         "particle_updates": args.particle_updates,
         "particle_sigma": args.particle_sigma,
-        "planning_horizon": args.planning_horizon,
+        "particle_temperature": args.particle_temperature,
         "evaluation_rollouts": args.evaluation_rollouts,
         "num_envs": args.num_envs,
         "max_steps": args.max_steps,
@@ -533,6 +495,7 @@ def _evaluate_policy(
                 args.max_steps,
                 args.particle_updates,
                 args.particle_sigma,
+                args.particle_temperature,
                 args.seed + 1_000_000 + rollout * args.evaluation_rollouts + evaluation_rollout,
                 generator,
                 record_frames=False,

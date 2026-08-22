@@ -11,7 +11,6 @@ from torch import nn
 
 from trans_wm_le.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN, WorldModelConfig
 from trans_wm_le.history import append_history
-from utils.value import EnsembleValueHead
 
 
 class ImageHistoryEncoder(nn.Module):
@@ -131,20 +130,16 @@ class LatentDynamics(nn.Module):
 @dataclass(frozen=True)
 class HeadOutput:
     reward: torch.Tensor
-    value: torch.Tensor
 
 
 class WorldHeads(nn.Module):
-    """Predicts reward from (latent, action) and value from latent."""
+    """Predicts reward from (latent, action)."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
         self.latent_dim = config.latent_dim
         self.action_dim = config.action_dim
         self.reward_head = _scalar_head(config, config.latent_dim + config.action_dim)
-        self.value_head = EnsembleValueHead(
-            config.latent_dim, config.model_dim, config.num_critics
-        )
 
     def forward(self, latent: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         if latent.ndim != 2 or latent.shape[1] != self.latent_dim:
@@ -152,10 +147,7 @@ class WorldHeads(nn.Module):
         action = action.flatten(start_dim=1)
         if action.shape != (latent.shape[0], self.action_dim):
             raise ValueError(f"action must have shape [batch, {self.action_dim}].")
-        return HeadOutput(
-            self.reward_head(torch.cat((latent, action), dim=-1)),
-            self.value_head(latent),
-        )
+        return HeadOutput(self.reward_head(torch.cat((latent, action), dim=-1)))
 
     def reward(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         action = action.flatten(start_dim=1)
@@ -177,7 +169,6 @@ class ActionEvaluation:
 class RolloutOutput:
     latents: torch.Tensor
     rewards: torch.Tensor
-    values: torch.Tensor
     scores: torch.Tensor
     final_z: torch.Tensor
     final_action_history: torch.Tensor
@@ -199,10 +190,6 @@ class WorldModel(nn.Module):
         self.ema_dynamics = deepcopy(self.dynamics).requires_grad_(False)
         self.ema_heads = deepcopy(self.heads).requires_grad_(False)
         self._set_ema_eval()
-
-    @property
-    def target_value_head(self) -> nn.Module:
-        return self.ema_heads.value_head
 
     def train(self, mode: bool = True) -> WorldModel:
         super().train(mode)
@@ -309,8 +296,8 @@ class WorldModel(nn.Module):
 
     def evaluate_action_online(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_online(z, action)
-        heads = HeadOutput(self.heads.reward(z, action), self.heads.value_head.mean(next_z))
-        return ActionEvaluation(next_z, heads, heads.reward + self.config.gamma * heads.value)
+        heads = HeadOutput(self.heads.reward(z, action))
+        return ActionEvaluation(next_z, heads, heads.reward)
 
     @torch.no_grad()
     def evaluate_action(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
@@ -319,10 +306,8 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     def evaluate_action_ema(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_ema(z, action)
-        heads = HeadOutput(
-            self.ema_heads.reward(z, action), self.ema_heads.value_head.mean(next_z)
-        )
-        return ActionEvaluation(next_z, heads, heads.reward + self.config.gamma * heads.value)
+        heads = HeadOutput(self.ema_heads.reward(z, action))
+        return ActionEvaluation(next_z, heads, heads.reward)
 
     @torch.no_grad()
     def update_target(self, ema: float | None = None) -> None:
@@ -391,7 +376,7 @@ class WorldModel(nn.Module):
             action_valid_mask = torch.ones(
                 action_history.shape[:2], dtype=torch.bool, device=action_history.device
             )
-        latents, rewards, values, scores = [], [], [], []
+        latents, rewards, scores = [], [], []
         evaluate = self.evaluate_action_online if online else self.evaluate_action_ema
         for action in actions.unbind(dim=1):
             evaluation = evaluate(z, action)
@@ -401,12 +386,10 @@ class WorldModel(nn.Module):
             )
             latents.append(z)
             rewards.append(evaluation.heads.reward)
-            values.append(evaluation.heads.value)
             scores.append(evaluation.score)
         return RolloutOutput(
             torch.stack(latents, dim=1),
             torch.stack(rewards, dim=1),
-            torch.stack(values, dim=1),
             torch.stack(scores, dim=1),
             z,
             action_history,
