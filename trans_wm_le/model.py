@@ -176,7 +176,7 @@ class RolloutOutput:
 
 
 class WorldModel(nn.Module):
-    """Observation encoder, 64D latent encoder, Transformer dynamics, and task heads."""
+    """Observation encoder, 128D latent encoder, Transformer dynamics, and task heads."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()

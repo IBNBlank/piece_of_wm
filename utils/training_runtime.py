@@ -285,7 +285,7 @@ def restore_checkpoint(
 ) -> CheckpointState:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if checkpoint.get("architecture_version") != architecture_version:
-        raise ValueError("Checkpoint uses the removed value head; retrain from scratch.")
+        raise ValueError("Checkpoint is incompatible with the current model architecture.")
     phase = checkpoint.get("phase", "training")
     if phase != expected_phase:
         raise ValueError(

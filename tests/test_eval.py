@@ -18,8 +18,6 @@ from utils.particle_policy import ParticlePolicy
 class OnlineEvaluationTest(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(3)
-        self.action_history = torch.zeros(2, 9, 1)
-        self.action_valid = torch.zeros(2, 9, dtype=torch.bool)
         self.particles = torch.linspace(-2.0, 2.0, 100).reshape(
             1, 100, 1, 1
         ).expand(2, -1, -1, -1)
@@ -29,7 +27,6 @@ class OnlineEvaluationTest(unittest.TestCase):
             TransWorldModelConfig(
                 observation_shape=(3, 32, 32),
                 action_shape=(1,),
-                latent_dim=8,
                 model_dim=8,
                 num_layers=1,
                 num_heads=1,
@@ -37,14 +34,11 @@ class OnlineEvaluationTest(unittest.TestCase):
                 cnn_channels=(4,),
             )
         ).eval()
-        latent = torch.randn(2, 8)
+        latent = torch.randn(2, 128)
 
         scores, rewards = score_particles(
-            "trans_wm",
             model,
             latent,
-            self.action_history,
-            self.action_valid,
             self.particles,
         )
 
@@ -62,14 +56,11 @@ class OnlineEvaluationTest(unittest.TestCase):
                 cnn_channels=(4,),
             )
         ).eval()
-        latent = torch.randn(2, 64)
+        latent = torch.randn(2, 128)
 
         action, predicted_reward = select_particle_action(
-            "trans_wm_le",
             model,
             latent,
-            self.action_history,
-            self.action_valid,
             ParticlePolicy(horizon=3),
             particle_updates=2,
             particle_sigma=0.1,
@@ -100,11 +91,8 @@ class OnlineEvaluationTest(unittest.TestCase):
         particles = torch.tensor([[[[1.0], [2.0], [3.0]], [[-1.0], [4.0], [2.0]]]])
 
         scores, first_rewards = score_particles(
-            "trans_wm_le",
             model,
             torch.zeros(1, 2),
-            torch.zeros(1, 9, 1),
-            torch.zeros(1, 9, dtype=torch.bool),
             particles,
         )
 

@@ -26,7 +26,7 @@ class TrainingConfig:
     sigreg_projections: int = 256
     sigreg_frequencies: int = 17
     sigreg_max_frequency: float = 5.0
-    planning_horizon: int = 10
+    planning_horizon: int = 16
 
     def __post_init__(self) -> None:
         if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
@@ -62,10 +62,10 @@ class TensorEpisodeBatch:
 
 @dataclass(frozen=True)
 class TensorTransitionBatch:
-    observations: torch.Tensor  # [B, 10 + P, C, H, W]
-    obs_valid: torch.Tensor  # [B, 10 + P]
-    action_history: torch.Tensor  # [B, 9, action_dim]
-    action_valid: torch.Tensor  # [B, 9]
+    observations: torch.Tensor  # [B, 5 + P, C, H, W]
+    obs_valid: torch.Tensor  # [B, 5 + P]
+    action_history: torch.Tensor  # [B, 4, action_dim]
+    action_valid: torch.Tensor  # [B, 4]
     actions: torch.Tensor  # [B, P, action_dim]
     rewards: torch.Tensor  # [B, P, 1]
     terminated: torch.Tensor  # [B, P]

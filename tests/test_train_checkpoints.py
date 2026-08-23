@@ -105,7 +105,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertEqual(args.particle_updates, 5)
                 self.assertEqual(args.num_particles, 1000)
                 self.assertEqual(args.particle_temperature, 2.0)
-                self.assertEqual(args.planning_horizon, 10)
+                self.assertEqual(args.planning_horizon, 16)
 
     def test_rolling_checkpoints_keep_latest_two_and_resolve_latest(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):

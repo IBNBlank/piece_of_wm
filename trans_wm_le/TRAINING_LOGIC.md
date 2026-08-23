@@ -44,14 +44,14 @@ flowchart TD
 在线模块是 `encoder`、`latent_encoder`、`dynamics` 和 `heads`。状态表征与预测关系为：
 
 ```text
-obs_history_t [B, 10, C, H, W] --CNN--> observation_t
-ah_t          [B,  9, A]       --mask/flatten-->
+obs_history_t [B, 5, C, H, W] --CNN--> observation_t
+ah_t          [B,  4, A]       --mask/flatten-->
 
-z_t = LatentEncoder(observation_t, ah_t)          # [B, 64]
-z_hat_{t+1} = TransformerDynamics(z_t, a_t)       # [B, 64]
+z_t = LatentEncoder(observation_t, ah_t)          # [B, 128]
+z_hat_{t+1} = TransformerDynamics(z_t, a_t)       # [B, 128]
 ```
 
-`dynamics` 内部将 64 维 `z_t` 和当前 action 分别线性投影到 `model_dim`，组成固定的两个 token，经过 Transformer 后读取第一个 token 并投影回 64 维。它不再次接收 `ah_t`，因为 action history 已经构成当前 `z_t` 的一部分。
+`dynamics` 内部将 128 维 `z_t` 和当前 action 分别线性投影到 `model_dim`，组成固定的两个 token，经过 Transformer 后读取第一个 token 并投影回 128 维。它不再次接收 `ah_t`，因为 action history 已经构成当前 `z_t` 的一部分。
 
 模型初始化时为每个在线模块创建一个冻结的 EMA 副本：`ema_encoder`、`ema_latent_encoder`、`ema_dynamics` 和 `ema_heads`。每次任一 optimizer step 后，所有 EMA 参数更新为：
 
@@ -73,17 +73,17 @@ sequenceDiagram
     participant E as EMA target encoder
 
     Note over O,A: Transition t
-    O->>M: last 10 images ending at o_t
-    A->>M: last 9 actions strictly before a_t (ah_t)
+    O->>M: last 5 images ending at o_t
+    A->>M: last 4 actions strictly before a_t (ah_t)
     M->>M: z_t = OnlineEncode(o_t history, ah_t)
     M->>M: z_hat_t+1 = OnlineDynamics(z_t, a_t)
-    A->>A: ah_t+1 = append(ah_t, a_t)[-9:]
-    O->>E: last 10 images ending at o_t+1
+    A->>A: ah_t+1 = append(ah_t, a_t)[-4:]
+    O->>E: last 5 images ending at o_t+1
     A->>E: ah_t+1
     E-->>M: stop_gradient(z_target_t+1)
 ```
 
-因此不会把 `a_t` 错当为构造 `z_t` 的历史的一部分，也不会在 target 分支遗漏 `a_t`。episode 开头不足 10 帧图像或 9 个 action 的位置为零，并由对应 boolean mask 标识；mask 进入 encoder 前会将 padding 值清零。
+因此不会把 `a_t` 错当为构造 `z_t` 的历史的一部分，也不会在 target 分支遗漏 `a_t`。episode 开头不足 5 帧图像或 4 个 action 的位置为零，并由对应 boolean mask 标识；mask 进入 encoder 前会将 padding 值清零。
 
 ## Replay World-Model Update
 
@@ -118,7 +118,7 @@ repeat epochs_per_rollout times:
 
 ```
 
-`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机起点更新。每个起点按唯一的 `PLANNING_HORIZON` 递归预测连续多步，所有有效预测步等权归一化；同一参数也控制粒子搜索的 reward-sum horizon，默认值为 10。
+`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机起点更新。每个起点按唯一的 `PLANNING_HORIZON` 递归预测连续多步，所有有效预测步等权归一化；同一参数也控制粒子搜索的 reward-sum horizon，默认值为 16。
 
 ## 验证与 Checkpoint
 

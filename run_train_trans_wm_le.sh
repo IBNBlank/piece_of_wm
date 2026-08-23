@@ -21,7 +21,7 @@
 #   PARTICLE_UPDATES      : particle resampling iterations (default: 5)
 #   PARTICLE_SIGMA        : particle perturbation standard deviation (default: 0.1)
 #   PARTICLE_TEMPERATURE  : softmax resampling temperature (default: 2.0)
-#   PLANNING_HORIZON      : WM training and policy planning horizon (default: 10)
+#   PLANNING_HORIZON      : WM training and policy planning horizon (default: 16)
 #   EVALUATION_ROLLOUTS   : online evaluation episodes per checkpoint (default: 10)
 #   EPOCHS_PER_ROLLOUT    : optimization epochs for each rollout (default: 10)
 #   CHECKPOINT_ROLLOUTS   : checkpoint frequency in rollouts (default: 10)
@@ -71,7 +71,7 @@ NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
 PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-16}"
 EVALUATION_ROLLOUTS="${EVALUATION_ROLLOUTS:-10}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-10}"
 CHECKPOINT_ROLLOUTS="${CHECKPOINT_ROLLOUTS:-10}"

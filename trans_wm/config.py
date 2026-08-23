@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from math import prod
 
 
-OBS_HISTORY_LEN = 10
-ACTION_HISTORY_LEN = 9
+OBS_HISTORY_LEN = 5
+ACTION_HISTORY_LEN = 4
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,7 @@ class WorldModelConfig:
 
     observation_shape: tuple[int, int, int]
     action_shape: tuple[int, ...]
+    observation_dim: int = 128
     latent_dim: int = 128
     model_dim: int = 256
     num_layers: int = 3
@@ -32,8 +33,10 @@ class WorldModelConfig:
             raise ValueError("action_shape must contain positive dimensions.")
         if not self.cnn_channels or any(size <= 0 for size in self.cnn_channels):
             raise ValueError("cnn_channels must contain positive dimensions.")
-        if self.latent_dim <= 0 or self.model_dim <= 0 or self.feedforward_dim <= 0:
+        if self.observation_dim <= 0 or self.model_dim <= 0 or self.feedforward_dim <= 0:
             raise ValueError("Model dimensions must be positive.")
+        if self.latent_dim != 128:
+            raise ValueError("latent_dim is fixed at 128 for trans_wm.")
         if self.num_layers <= 0 or self.num_heads <= 0:
             raise ValueError("num_layers and num_heads must be positive.")
         if self.model_dim % self.num_heads:

@@ -18,11 +18,11 @@
 #   PARTICLE_UPDATES        : particle resampling iterations per action (default: 5)
 #   PARTICLE_SIGMA          : particle perturbation standard deviation (default: 0.1)
 #   PARTICLE_TEMPERATURE    : softmax resampling temperature (default: 2.0)
-#   PLANNING_HORIZON        : model steps used for training and planning (default: 10)
+#   PLANNING_HORIZON        : model steps used for training and planning (default: 16)
 #   SEED                    : environment and policy seed
 #   DEVICE                  : torch device; empty selects CUDA when available
 #   OUTPUT                  : JSON results path
-#   VISUAL_DIR              : online return plot and episode GIF directory
+#   VISUAL_DIR              : online return plot and per-episode GIF directory
 #   FPS                     : GIF playback frame rate
 #   EXTRA_ARGS              : additional arguments forwarded to eval.py
 ###############################################################################
@@ -45,7 +45,7 @@ if [ ! -x "${PYTHON}" ]; then
 	exit 1
 fi
 
-MODEL="${MODEL:-all}"
+MODEL="${MODEL:-trans_wm_le}"
 ENV_ID="${ENV_ID:-Pendulum-v1}"
 TRANS_WM_CHECKPOINT="${TRANS_WM_CHECKPOINT:-runs/trans_wm/checkpoint_best.pt}"
 TRANS_WM_LE_CHECKPOINT="${TRANS_WM_LE_CHECKPOINT:-runs/trans_wm_le/checkpoint_best.pt}"
@@ -55,7 +55,7 @@ PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
 PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-16}"
 SEED="${SEED:-0}"
 DEVICE="${DEVICE:-}"
 OUTPUT="${OUTPUT:-runs/eval/results.json}"

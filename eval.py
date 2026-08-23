@@ -21,8 +21,8 @@ from utils.particle_policy import ParticlePolicy
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
-OBS_HISTORY_LEN = 10
-ACTION_HISTORY_LEN = 9
+OBS_HISTORY_LEN = 5
+ACTION_HISTORY_LEN = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=10)
+    parser.add_argument("--planning-horizon", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None, help="Defaults to CUDA when available.")
     parser.add_argument("--output", type=Path, default=Path("runs/eval/results.json"))
@@ -141,10 +141,10 @@ def load_model(model_name: str, checkpoint_path: Path, device: torch.device) -> 
         raise FileNotFoundError(f"Checkpoint not found for {model_name}: {checkpoint_path}")
     package = importlib.import_module(model_name)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    expected_version = {"trans_wm": 5, "trans_wm_le": 5}[model_name]
+    expected_version = {"trans_wm": 7, "trans_wm_le": 7}[model_name]
     if checkpoint.get("architecture_version") != expected_version:
         raise ValueError(
-            f"{checkpoint_path} is incompatible with the reward-only architecture; "
+            f"{checkpoint_path} is incompatible with the current model architecture; "
             "retrain from scratch."
         )
     model = package.WorldModel(package.WorldModelConfig(**checkpoint["model_config"])).to(device)
@@ -189,7 +189,7 @@ def evaluate_online(
                 particle_temperature,
                 seed + episode,
                 generator,
-                record_frames=record_video and episode == 0,
+                record_frames=record_video,
             )
             episode_records.append(record)
             print(
@@ -206,17 +206,18 @@ def evaluate_online(
     _returns_image(returns).save(metrics_path)
     artifacts = {"returns": str(metrics_path)}
     if record_video:
-        video_path = output_dir / "online_episode.gif"
-        frames = episode_records[0]["frames"]
-        frames[0].save(
-            video_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=max(1, round(1000 / fps)),
-            loop=0,
-            disposal=2,
-        )
-        artifacts["video"] = str(video_path)
+        for episode, record in enumerate(episode_records, start=1):
+            video_path = output_dir / f"online_episode_{episode:03d}.gif"
+            frames = record["frames"]
+            frames[0].save(
+                video_path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=max(1, round(1000 / fps)),
+                loop=0,
+                disposal=2,
+            )
+            artifacts[f"video_episode_{episode}"] = str(video_path)
     return {
         **_return_summary(returns),
         "episode_lengths": [record["length"] for record in episode_records],
@@ -249,18 +250,12 @@ def run_online_episode(
         observation_history, observation_valid = _observation_history(images, model)
         action_history, action_valid = _action_history(actions, model)
         with torch.inference_mode():
-            if model_name == "trans_wm":
-                latent = model.encode_ema(observation_history, observation_valid)
-            else:
-                latent = model.encode_ema(
-                    observation_history, observation_valid, action_history, action_valid
-                )
+            latent = model.encode_ema(
+                observation_history, observation_valid, action_history, action_valid
+            )
             action, predicted_reward = select_particle_action(
-                model_name,
                 model,
                 latent,
-                action_history,
-                action_valid,
                 policy,
                 particle_updates,
                 particle_sigma,
@@ -295,11 +290,8 @@ def run_online_episode(
 
 
 def select_particle_action(
-    model_name: str,
     model: Any,
     latent: torch.Tensor,
-    action_history: torch.Tensor,
-    action_valid: torch.Tensor,
     policy: ParticlePolicy,
     particle_updates: int,
     particle_sigma: float,
@@ -312,11 +304,8 @@ def select_particle_action(
     )
     for update_index in range(particle_updates):
         scores, _ = score_particles(
-            model_name,
             model,
             latent,
-            action_history,
-            action_valid,
             particles,
         )
         particles = policy.update_particles(
@@ -327,11 +316,8 @@ def select_particle_action(
             generator=generator,
         )
     scores, rewards = score_particles(
-        model_name,
         model,
         latent,
-        action_history,
-        action_valid,
         particles,
     )
     best = scores.argmax(dim=1)
@@ -345,11 +331,8 @@ def _particle_sigma(initial_sigma: float, horizon: int, update_index: int) -> fl
 
 
 def score_particles(
-    model_name: str,
     model: Any,
     latent: torch.Tensor,
-    action_history: torch.Tensor,
-    action_valid: torch.Tensor,
     particles: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if particles.ndim != 4:
@@ -359,12 +342,6 @@ def score_particles(
         raise ValueError("particle sequence horizon must be positive.")
     repeated_latent = latent[:, None].expand(-1, num_particles, -1).reshape(
         batch_size * num_particles, -1
-    )
-    repeated_history = action_history[:, None].expand(
-        -1, num_particles, -1, -1
-    ).reshape(batch_size * num_particles, ACTION_HISTORY_LEN, action_dim)
-    repeated_valid = action_valid[:, None].expand(-1, num_particles, -1).reshape(
-        batch_size * num_particles, ACTION_HISTORY_LEN
     )
     scores = torch.zeros(batch_size, num_particles, device=latent.device, dtype=latent.dtype)
     first_rewards = None
@@ -378,16 +355,7 @@ def score_particles(
         if first_rewards is None:
             first_rewards = rewards
         scores = scores + rewards
-        if model_name == "trans_wm":
-            repeated_latent = model.predict_next_ema(
-                repeated_latent, repeated_history, flat_actions, repeated_valid
-            )
-            package = importlib.import_module(model_name)
-            repeated_history, repeated_valid = package.append_history(
-                repeated_history, repeated_valid, flat_actions
-            )
-        else:
-            repeated_latent = model.predict_next_ema(repeated_latent, flat_actions)
+        repeated_latent = model.predict_next_ema(repeated_latent, flat_actions)
     return scores, first_rewards
 
 

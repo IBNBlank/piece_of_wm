@@ -39,6 +39,10 @@ DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
 ./run_integrate_trans_wm_le.sh
 ```
 
+The integrated runners automatically resume the newest numbered checkpoint in
+each stage's output directory. Explicit `PRETRAIN_RESUME` and `TRAIN_RESUME`
+values take precedence. Use a new output directory for a fresh run.
+
 Pretraining uses replay updates only. It does not create a Gym environment or
 run the particle policy. Validation loss selects
 `checkpoint_best.pt`; the two newest numbered checkpoints are retained for
@@ -88,7 +92,7 @@ so the training configuration cannot silently disagree with the collected
 rollout layout.
 
 The script samples bounded transition batches from the sequence rollouts, so it
-does not materialize all ten-frame windows for an entire dataset in memory. To
+does not materialize all five-frame windows for an entire dataset in memory. To
 continue from a checkpoint, set `RESUME` to a checkpoint file or the run
 directory and keep the matching model/training arguments in `EXTRA_ARGS`. A run
 directory automatically selects its newest numbered checkpoint:
@@ -111,7 +115,8 @@ policy is evaluated over 10 separate episodes. The two newest numbered
 checkpoints are retained for resuming, while `checkpoint_best.pt` retains the
 highest evaluation return.
 
-World-model updates use the same `PLANNING_HORIZON` as policy evaluation. From
+World-model updates use the same `PLANNING_HORIZON` as policy evaluation. Its
+default is 16. From
 each sampled starting state, dynamics is recursively unrolled over consecutive
 dataset actions. Every valid prediction step contributes equally to the
 normalized loss; episode-tail padding is masked and no discount is applied.
@@ -134,5 +139,5 @@ EPISODES=5 DEVICE=cuda \
 
 Results include per-episode online returns, a same-seed random-policy baseline,
 an online return plot, and a GIF recorded from the first environment episode.
-The default `PLANNING_HORIZON` is ten model steps and is shared by recursive
+The default `PLANNING_HORIZON` is sixteen model steps and is shared by recursive
 world-model training and particle planning.

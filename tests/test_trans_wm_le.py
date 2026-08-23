@@ -70,7 +70,7 @@ class WorldModelShapeTest(unittest.TestCase):
         torch.manual_seed(3)
         self.model = WorldModel(_config()).eval()
 
-    def test_cnn_output_is_observation_and_obs_plus_ah_produces_64d_latent(self) -> None:
+    def test_cnn_output_is_observation_and_obs_plus_ah_produces_128d_latent(self) -> None:
         images = torch.randn(4, OBS_HISTORY_LEN, 3, 32, 32)
         obs_mask = torch.ones(4, OBS_HISTORY_LEN, dtype=torch.bool)
         action_history = torch.randn(4, ACTION_HISTORY_LEN, 2)
@@ -80,7 +80,7 @@ class WorldModelShapeTest(unittest.TestCase):
         latent = self.model.encode(images, obs_mask, action_history, action_mask)
 
         self.assertEqual(observation.shape, (4, 12))
-        self.assertEqual(latent.shape, (4, 64))
+        self.assertEqual(latent.shape, (4, 128))
         changed = action_history.clone()
         changed[:, -1] += 1.0
         self.assertFalse(
@@ -88,7 +88,7 @@ class WorldModelShapeTest(unittest.TestCase):
         )
 
     def test_dynamics_uses_latent_and_current_action_tokens(self) -> None:
-        latent = torch.randn(4, 64)
+        latent = torch.randn(4, 128)
         action = torch.randn(4, 2)
         captured: list[torch.Size] = []
 
@@ -100,11 +100,11 @@ class WorldModelShapeTest(unittest.TestCase):
         finally:
             handle.remove()
 
-        self.assertEqual(next_latent.shape, (4, 64))
+        self.assertEqual(next_latent.shape, (4, 128))
         self.assertEqual(captured, [torch.Size((4, 2, 16))])
 
     def test_decoder_and_observation_head_are_absent(self) -> None:
-        heads = self.model.predict_heads(torch.randn(3, 64), torch.randn(3, 2))
+        heads = self.model.predict_heads(torch.randn(3, 128), torch.randn(3, 2))
 
         self.assertEqual(heads.reward.shape, (3, 1))
         self.assertFalse(hasattr(heads, "value"))
@@ -112,17 +112,17 @@ class WorldModelShapeTest(unittest.TestCase):
         self.assertFalse(hasattr(self.model.heads, "observation_head"))
 
     def test_rollout_updates_history_but_dynamics_only_receives_action(self) -> None:
-        latent = torch.randn(2, 64)
+        latent = torch.randn(2, 128)
         action_history = torch.randn(2, ACTION_HISTORY_LEN, 2)
-        action_mask = torch.tensor([[False] * 7 + [True] * 2, [True] * 9])
+        action_mask = torch.tensor([[False] * 2 + [True] * 2, [True] * ACTION_HISTORY_LEN])
         actions = torch.randn(2, 3, 2)
 
         output = self.model.rollout(latent, action_history, actions, action_mask)
 
-        self.assertEqual(output.latents.shape, (2, 3, 64))
+        self.assertEqual(output.latents.shape, (2, 3, 128))
         self.assertEqual(output.rewards.shape, (2, 3, 1))
         self.assertFalse(hasattr(output, "values"))
-        self.assertEqual(output.final_action_history.shape, (2, 9, 2))
+        self.assertEqual(output.final_action_history.shape, (2, ACTION_HISTORY_LEN, 2))
         torch.testing.assert_close(output.final_action_history[:, -3:], actions)
 
 
@@ -209,7 +209,7 @@ class WorldModelTrainingTest(unittest.TestCase):
         )
 
         self.assertEqual(sampled.actions.shape, (2, 3, 2))
-        self.assertEqual(sampled.target_observations.shape, (2, 3, 10, 3, 32, 32))
+        self.assertEqual(sampled.target_observations.shape, (2, 3, 5, 3, 32, 32))
         torch.testing.assert_close(
             sampled.transition_valid,
             torch.tensor([[True, True, False], [True, True, True]]),
@@ -256,7 +256,7 @@ class WorldModelTrainingTest(unittest.TestCase):
         )
 
     def test_sigreg_is_finite_and_backpropagates(self) -> None:
-        latents = torch.randn(16, 64, requires_grad=True)
+        latents = torch.randn(16, 128, requires_grad=True)
 
         loss = sigreg_loss(latents, num_projections=8, num_frequencies=4)
         loss.backward()

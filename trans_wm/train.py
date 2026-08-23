@@ -30,7 +30,7 @@ from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutRepl
 
 
 LOGGER = logging.getLogger("piece_of_wm.trans_wm")
-ARCHITECTURE_VERSION = 5
+ARCHITECTURE_VERSION = 7
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=10)
+    parser.add_argument("--planning-horizon", type=int, default=16)
     parser.add_argument("--evaluation-rollouts", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10, help="Offline pretraining epochs.")
     parser.add_argument(
@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--pretrained-checkpoint", type=Path, default=None)
     parser.add_argument("--pretrain", action="store_true", help="Train only the world model.")
-    parser.add_argument("--latent-dim", type=int, default=128)
+    parser.add_argument("--observation-dim", type=int, default=128)
     parser.add_argument("--model-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -135,7 +135,7 @@ def main() -> None:
     model_config = WorldModelConfig(
         observation_shape=observation_shape,
         action_shape=action_shape,
-        latent_dim=args.latent_dim,
+        observation_dim=args.observation_dim,
         model_dim=args.model_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,

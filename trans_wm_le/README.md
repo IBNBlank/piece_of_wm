@@ -6,8 +6,8 @@
 
 模型将表示明确分成两层：
 
-- 最近 10 帧图像经过 CNN 得到 `obs tensor`；
-- `obs tensor` 与最近 9 个已执行 action 组成的 `ah tensor` 经过小型 MLP，得到固定 64 维 `latent state`。
+- 最近 5 帧图像经过 CNN 得到 `obs tensor`；
+- `obs tensor` 与最近 4 个已执行 action 组成的 `ah tensor` 经过小型 MLP，得到固定 128 维 `latent state`。
 
 外部 policy 给出当前 action 后，Transformer Dynamics 根据当前 latent 和 action 预测下一个 latent。训练时，预测 latent 通过 JEPA loss 对齐由下一真实 observation 和更新后 action history 编码得到的 EMA target latent，并使用 SIGReg 防止表示坍塌。
 
@@ -16,9 +16,9 @@
 ```mermaid
 flowchart LR
     subgraph ObservationEncoder[Observation Encoder]
-        IM["最近 10 张图像<br/>B x 10 x C x H x W"]
-        OM["obs_valid_mask<br/>B x 10"]
-        STACK["屏蔽 padding<br/>沿 channel 拼接<br/>B x (10*C) x H x W"]
+        IM["最近 5 张图像<br/>B x 5 x C x H x W"]
+        OM["obs_valid_mask<br/>B x 5"]
+        STACK["屏蔽 padding<br/>沿 channel 拼接<br/>B x (5*C) x H x W"]
         CNN["多层 stride-2 CNN"]
         OBS["obs tensor<br/>B x observation_dim"]
         IM --> STACK
@@ -27,9 +27,9 @@ flowchart LR
     end
 
     subgraph ActionHistory[Action History]
-        A9["状态前最近 9 个 action<br/>B x 9 x A"]
-        AM["action_valid_mask<br/>B x 9"]
-        AH["屏蔽 padding 后拉直<br/>ah tensor: B x (9*A)"]
+        A9["状态前最近 4 个 action<br/>B x 4 x A"]
+        AM["action_valid_mask<br/>B x 4"]
+        AH["屏蔽 padding 后拉直<br/>ah tensor: B x (4*A)"]
         A9 --> AH
         AM -.-> AH
     end
@@ -37,7 +37,7 @@ flowchart LR
     subgraph LatentEncoder[Latent Encoder]
         CAT1["concat(obs, ah)"]
         LMLP["Linear + GELU + Linear"]
-        Z["当前 latent z(t)<br/>B x 64"]
+        Z["当前 latent z(t)<br/>B x 128"]
         OBS --> CAT1
         AH --> CAT1
         CAT1 --> LMLP --> Z
@@ -48,7 +48,7 @@ flowchart LR
         ZTOKEN["z token"]
         ATOKEN["当前 action token"]
         TRANSFORMER["Transformer Encoder<br/>固定 2 个 token"]
-        ZP["预测 latent z_hat(t+1)<br/>B x 64"]
+        ZP["预测 latent z_hat(t+1)<br/>B x 128"]
         Z --> ZTOKEN --> TRANSFORMER
         A --> ATOKEN --> TRANSFORMER
         TRANSFORMER -->|读取 z token 对位输出| ZP
@@ -65,7 +65,7 @@ flowchart LR
         NEXTIM["下一真实图像历史<br/>ending at o(t+1)"]
         NEXTAH["ah(t+1)<br/>append ah(t), a(t)"]
         EMAENC["frozen EMA<br/>Observation + Latent Encoder"]
-        ZT["target latent z_target(t+1)<br/>B x 64"]
+        ZT["target latent z_target(t+1)<br/>B x 128"]
         NEXTIM --> EMAENC
         NEXTAH --> EMAENC
         EMAENC --> ZT
@@ -76,7 +76,7 @@ flowchart LR
     Z --> SIG["SIGReg<br/>isotropic Gaussian regularization"]
 
     ZP -->|替换当前 latent| ROLLOUT["下一 rollout step"]
-    A -->|追加并保留最近 9 个| A9N["新的 action history"]
+    A -->|追加并保留最近 4 个| A9N["新的 action history"]
     A9N --> ROLLOUT
 
     ONLINE["online Encoder + Dynamics + Heads"] -->|EMA update| EMA["frozen EMA modules"]
@@ -88,14 +88,14 @@ flowchart LR
 Observation Encoder 输入固定为：
 
 ```text
-obs_history:    [B, 10, C, H, W]
-obs_valid_mask: [B, 10]
+obs_history:    [B, 5, C, H, W]
+obs_valid_mask: [B, 5]
 ```
 
-padding 位置先由 `obs_valid_mask` 清零，然后 10 张图像沿 channel 维拼接：
+padding 位置先由 `obs_valid_mask` 清零，然后 5 张图像沿 channel 维拼接：
 
 ```text
-[B, 10, C, H, W] -> [B, 10*C, H, W]
+[B, 5, C, H, W] -> [B, 5*C, H, W]
 ```
 
 拼接结果经过多层 stride-2 CNN，再通过 `Flatten + Linear` 得到：
@@ -106,29 +106,29 @@ obs_tensor_t: [B, observation_dim]
 
 这里的输出只是由图像历史得到的 observation representation，不再称为 `z tensor`。Encoder 是确定性的，不输出 mean、log-variance，也不进行 sampling。
 
-episode 开头不足 10 帧的位置使用零值左 padding，不重复第一帧。
+episode 开头不足 5 帧的位置使用零值左 padding，不重复第一帧。
 
 ## Action History
 
 状态 `t` 的 action history 只包含 `a_t` 之前已经执行的 action：
 
 ```text
-action_history_t: [B, 9, action_dim]
-action_valid_mask: [B, 9]
+action_history_t: [B, 4, action_dim]
+action_valid_mask: [B, 4]
 ```
 
 padding action 先由 `action_valid_mask` 清零，再拉直为一个整体的 `ah tensor`：
 
 ```text
-ah_t: [B, 9 * action_dim]
+ah_t: [B, 4 * action_dim]
 ```
 
-`action_history_tensor` 支持传入原始 history 和 mask。`encode` / `encode_online` 既支持原始 `[B,9,A]` history，也支持已经拉直的 `[B,9*A]` tensor；传入拉直 tensor 时不再额外传 mask。
+`action_history_tensor` 支持传入原始 history 和 mask。`encode` / `encode_online` 既支持原始 `[B,4,A]` history，也支持已经拉直的 `[B,4*A]` tensor；传入拉直 tensor 时不再额外传 mask。
 
 下一状态的 action history 必须包含当前 transition 的 action：
 
 ```text
-ah_{t+1} = append(ah_t, a_t)[-9:]
+ah_{t+1} = append(ah_t, a_t)[-4:]
 ```
 
 这一步同时用于真实下一 latent 的 JEPA target 编码，不能继续使用 `ah_t`，否则 observation 与 action history 会错位。
@@ -146,12 +146,12 @@ z_t = Linear(
         )
       )
 
-z_t: [B, 64]
+z_t: [B, 128]
 ```
 
-`latent_dim` 在 `trans_wm_le` 中固定为 64，配置为其他值会直接报错。`observation_dim` 与 `model_dim` 仍可配置。
+`latent_dim` 在 `trans_wm_le` 中固定为 128，配置为其他值会直接报错。`observation_dim` 与 `model_dim` 仍可配置。
 
-模型只维护当前一个 latent，不维护 `z_{t-9:t}` 或其他 latent history。
+模型只维护当前一个 latent，不维护 latent history。
 
 ## Latent Dynamics
 
@@ -163,18 +163,18 @@ Dynamics 是确定性的 Transformer Encoder，只读取当前 latent 和当前 
 
 z_hat_{t+1} = Transformer(z_t token, a_t token)[z position]
 
-z_t:           [B, 64]
+z_t:           [B, 128]
 a_t:           [B, action_dim]
-z_hat_{t+1}:   [B, 64]
+z_hat_{t+1}:   [B, 128]
 ```
 
 Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 `z_t`，因此再次送入 Dynamics 会重复建模同一信息。
 
-两个输入分别经过独立 Linear projection 映射到 `model_dim`，加上位置 embedding 后进入 Transformer，最后读取 `z_t` token 对应位置并映射回 64 维。这里没有概率分布、noise 或 sampling；当 `dropout=0` 时，相同输入始终产生相同的预测 latent。
+两个输入分别经过独立 Linear projection 映射到 `model_dim`，加上位置 embedding 后进入 Transformer，最后读取 `z_t` token 对应位置并映射回 128 维。这里没有概率分布、noise 或 sampling；当 `dropout=0` 时，相同输入始终产生相同的预测 latent。
 
 ## Heads 与 Action Score
 
-模型不包含 Observation Head、图像 decoder 或 Value Head。Reward Head 读取 64 维 latent 和当前 action。
+模型不包含 Observation Head、图像 decoder 或 Value Head。Reward Head 读取 128 维 latent 和当前 action。
 
 ### Reward Head
 
@@ -250,7 +250,7 @@ obs_t -> action_t -> obs_{t+1}
                     z_target_{t+1}
 ```
 
-`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 10 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
+`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 16 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
 
 ## 损失函数
 
@@ -290,7 +290,7 @@ L_JEPA(t) = mean((z_hat_{t+1} - z_target_{t+1})^2)
 
 只使用 JEPA matching 时，所有样本映射到相同 latent 也可能形成低损失解。SIGReg 用随机一维投影约束在线 latent 的分布接近各向同性标准高斯。
 
-对于在线 latent `z_i in R^64`，采样并归一化随机方向：
+对于在线 latent `z_i in R^128`，采样并归一化随机方向：
 
 ```text
 u_k = g_k / ||g_k||,  g_k ~ Normal(0, I)
@@ -400,7 +400,7 @@ model = WorldModel(
         observation_shape=(3, 128, 128),  # C, H, W
         action_shape=(7,),
         observation_dim=128,
-        latent_dim=64,  # trans_wm_le 中固定为 64
+        latent_dim=128,  # trans_wm_le 中固定为 128
         model_dim=256,
         num_layers=3,
         num_heads=4,
@@ -425,13 +425,13 @@ metrics = trainer.train_batch(replay_buffer.sample())
 
 # 默认 encode 使用冻结的 EMA Observation Encoder 和 Latent Encoder。
 z_t = model.encode(
-    obs_history,          # [B, 10, C, H, W]
-    obs_valid_mask,       # [B, 10]
-    action_history,       # [B, 9, action_dim]
-    action_valid_mask,    # [B, 9]
+    obs_history,          # [B, 5, C, H, W]
+    obs_valid_mask,       # [B, 5]
+    action_history,       # [B, 4, action_dim]
+    action_valid_mask,    # [B, 4]
 )
 
-# Dynamics 只需要当前 64D latent 和当前 action。
+# Dynamics 只需要当前 128D latent 和当前 action。
 z_next = model.predict_next(z_t, action)
 
 # 从当前 latent 和 action 预测 transition reward。

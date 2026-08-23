@@ -20,7 +20,7 @@
 #   PARTICLE_UPDATES    : particle resampling iterations (default: 5)
 #   PARTICLE_SIGMA      : particle perturbation standard deviation (default: 0.1)
 #   PARTICLE_TEMPERATURE: softmax resampling temperature (default: 2.0)
-#   PLANNING_HORIZON    : WM training and policy planning horizon (default: 10)
+#   PLANNING_HORIZON    : WM training and policy planning horizon (default: 16)
 #   EVALUATION_ROLLOUTS : online evaluation episodes per checkpoint (default: 10)
 #   EPOCHS_PER_ROLLOUT  : optimization epochs for each rollout (default: 10)
 #   CHECKPOINT_ROLLOUTS : checkpoint frequency in rollouts (default: 10)
@@ -28,7 +28,7 @@
 #   DEVICE               : torch device; empty selects CUDA when available
 #   RESUME               : checkpoint path to resume (default: empty)
 #   PRETRAINED_CHECKPOINT: pretraining checkpoint used to initialize training
-#   LATENT_DIM           : latent state dimension (default: 128)
+#   OBSERVATION_DIM      : image observation representation dimension (default: 128)
 #   MODEL_DIM            : Transformer token dimension (default: 256)
 #   NUM_LAYERS           : Transformer encoder layers (default: 3)
 #   NUM_HEADS            : attention heads per Transformer layer (default: 4)
@@ -74,7 +74,7 @@ NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
 PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-16}"
 EVALUATION_ROLLOUTS="${EVALUATION_ROLLOUTS:-10}"
 EPOCHS_PER_ROLLOUT="${EPOCHS_PER_ROLLOUT:-10}"
 CHECKPOINT_ROLLOUTS="${CHECKPOINT_ROLLOUTS:-10}"
@@ -82,7 +82,7 @@ SEED="${SEED:-0}"
 DEVICE="${DEVICE:-}"
 RESUME="${RESUME:-}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
-LATENT_DIM="${LATENT_DIM:-128}"
+OBSERVATION_DIM="${OBSERVATION_DIM:-128}"
 MODEL_DIM="${MODEL_DIM:-256}"
 NUM_LAYERS="${NUM_LAYERS:-3}"
 NUM_HEADS="${NUM_HEADS:-4}"
@@ -121,7 +121,7 @@ args=(
 	--epochs-per-rollout "${EPOCHS_PER_ROLLOUT}"
 	--checkpoint-rollouts "${CHECKPOINT_ROLLOUTS}"
 	--seed "${SEED}"
-	--latent-dim "${LATENT_DIM}"
+	--observation-dim "${OBSERVATION_DIM}"
 	--model-dim "${MODEL_DIM}"
 	--num-layers "${NUM_LAYERS}"
 	--num-heads "${NUM_HEADS}"
@@ -150,7 +150,7 @@ fi
 
 echo "[run_train_trans_wm] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
 echo "[run_train_trans_wm] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
-echo "[run_train_trans_wm] latent_dim=${LATENT_DIM} model_dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS}"
+echo "[run_train_trans_wm] observation_dim=${OBSERVATION_DIM} latent_dim=128 model_dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS}"
 
 # shellcheck disable=SC2086
 "${PYTHON}" -m trans_wm.train "${args[@]}" ${EXTRA_ARGS} "$@"

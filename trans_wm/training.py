@@ -24,7 +24,7 @@ class TrainingConfig:
     reward_weight: float = 1.0
     vae_reconstruction_weight: float = 1.0
     vae_kl_weight: float = 1e-4
-    planning_horizon: int = 10
+    planning_horizon: int = 16
 
     def __post_init__(self) -> None:
         if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
@@ -57,10 +57,10 @@ class TensorEpisodeBatch:
 
 @dataclass(frozen=True)
 class TensorTransitionBatch:
-    observations: torch.Tensor  # [B, 10 + P, C, H, W]
-    obs_valid: torch.Tensor  # [B, 10 + P]
-    action_history: torch.Tensor  # [B, 9, action_dim]
-    action_valid: torch.Tensor  # [B, 9]
+    observations: torch.Tensor  # [B, 5 + P, C, H, W]
+    obs_valid: torch.Tensor  # [B, 5 + P]
+    action_history: torch.Tensor  # [B, 4, action_dim]
+    action_valid: torch.Tensor  # [B, 4]
     actions: torch.Tensor  # [B, P, action_dim]
     rewards: torch.Tensor  # [B, P, 1]
     terminated: torch.Tensor  # [B, P]
@@ -263,8 +263,14 @@ def encode_sequence(
     obs_windows, obs_masks = history_windows(
         batch.observations, batch.state_valid, OBS_HISTORY_LEN
     )
+    action_windows, action_masks = _state_action_windows(batch)
     batch_size, states = batch.observations.shape[:2]
-    latents = model.encode_online(obs_windows.flatten(0, 1), obs_masks.flatten(0, 1))
+    latents = model.encode_online(
+        obs_windows.flatten(0, 1),
+        obs_masks.flatten(0, 1),
+        action_windows.flatten(0, 1),
+        action_masks.flatten(0, 1),
+    )
     return (
         latents.reshape(batch_size, states, model.config.latent_dim),
         obs_windows,
@@ -293,19 +299,20 @@ def world_model_loss(
     batch_size, states = batch.observations.shape[:2]
     flat_windows = obs_windows.flatten(0, 1)
     flat_masks = obs_masks.flatten(0, 1)
-    posterior = model.encoder.posterior(flat_windows, flat_masks)
+    action_windows, action_masks = _state_action_windows(batch)
+    posterior = model.posterior_online(
+        flat_windows,
+        flat_masks,
+        action_windows.flatten(0, 1),
+        action_masks.flatten(0, 1),
+    )
     latents = posterior.mean.reshape(batch_size, states, model.config.latent_dim)
     vae_reconstruction = model.heads.observation_head(posterior.rsample())
     vae_reconstruction_per_state = (
         (vae_reconstruction - flat_windows).flatten(1).square().mean(dim=1)
     )
     vae_kl_per_state = vae_kl_loss(posterior.mean, posterior.log_variance)
-    action_windows, action_masks = previous_history_windows(
-        batch.actions, batch.transition_valid, ACTION_HISTORY_LEN
-    )
     rollout_z = latents[:, :-1]
-    rollout_history = action_windows
-    rollout_history_valid = action_masks
     observation_errors = []
     reward_errors = []
     rollout_valid = []
@@ -318,9 +325,7 @@ def world_model_loss(
         ).reshape(*step_actions.shape[:2], 1)
         predicted_next_z = model.predict_next_online(
             rollout_z.flatten(0, 1),
-            rollout_history.flatten(0, 1),
             step_actions.flatten(0, 1),
-            rollout_history_valid.flatten(0, 1),
         ).reshape(*step_actions.shape[:2], model.config.latent_dim)
         predicted_observation = model.heads.observation_head(
             predicted_next_z.flatten(0, 1)
@@ -336,18 +341,7 @@ def world_model_loss(
         )
         rollout_valid.append(step_valid)
         if offset + 1 < rollout_steps:
-            next_history, next_history_valid = append_history(
-                rollout_history.flatten(0, 1),
-                rollout_history_valid.flatten(0, 1),
-                step_actions.flatten(0, 1),
-            )
             rollout_z = predicted_next_z[:, :-1]
-            rollout_history = next_history.reshape(
-                *step_actions.shape[:2], ACTION_HISTORY_LEN, model.config.action_dim
-            )[:, :-1]
-            rollout_history_valid = next_history_valid.reshape(
-                *step_actions.shape[:2], ACTION_HISTORY_LEN
-            )[:, :-1]
 
     valid = torch.cat([item.flatten() for item in rollout_valid]).to(dtype=latents.dtype)
     observation_loss = _masked_mean(
@@ -376,8 +370,11 @@ def transition_world_model_loss(
     config: TrainingConfig,
 ) -> WorldModelLosses:
     """Computes task and same-window VAE objectives on sampled transitions."""
-    current_posterior = model.encoder.posterior(
-        batch.current_observations, batch.current_obs_valid
+    current_posterior = model.posterior_online(
+        batch.current_observations,
+        batch.current_obs_valid,
+        batch.action_history,
+        batch.action_valid,
     )
     batch_size, horizon = batch.actions.shape[:2]
     rollout_z = current_posterior.mean
@@ -395,17 +392,21 @@ def transition_world_model_loss(
         target_obs_valid = batch.obs_valid[
             :, offset + 1 : offset + 1 + OBS_HISTORY_LEN
         ]
-        target_posterior = model.encoder.posterior(
-            target_observation, target_obs_valid
+        rollout_history, rollout_history_valid = append_history(
+            rollout_history, rollout_history_valid, action
+        )
+        target_posterior = model.posterior_online(
+            target_observation,
+            target_obs_valid,
+            rollout_history,
+            rollout_history_valid,
         )
         reward_errors.append(
             (model.heads.reward(rollout_z, action) - batch.rewards[:, offset])
             .square()
             .squeeze(-1)
         )
-        rollout_z = model.predict_next_online(
-            rollout_z, rollout_history, action, rollout_history_valid
-        )
+        rollout_z = model.predict_next_online(rollout_z, action)
         observation_errors.append(
             (model.heads.observation_head(rollout_z) - target_observation)
             .flatten(1)
@@ -420,9 +421,6 @@ def transition_world_model_loss(
         )
         target_vae_kls.append(
             vae_kl_loss(target_posterior.mean, target_posterior.log_variance)
-        )
-        rollout_history, rollout_history_valid = append_history(
-            rollout_history, rollout_history_valid, action
         )
     valid = batch.transition_valid.flatten().to(dtype=rollout_z.dtype)
     observation_loss = _masked_mean(torch.stack(observation_errors, dim=1).flatten(), valid)
@@ -620,6 +618,17 @@ class WorldModelTrainer:
                 metrics = self.train_transitions(batch, batch_size, rng)
             history.append(metrics)
         return history
+
+
+def _state_action_windows(
+    batch: TensorEpisodeBatch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    padding = torch.zeros_like(batch.actions[:, :1])
+    padded_actions = torch.cat((batch.actions, padding), dim=1)
+    padded_valid = torch.cat(
+        (batch.transition_valid, torch.zeros_like(batch.transition_valid[:, :1])), dim=1
+    )
+    return previous_history_windows(padded_actions, padded_valid, ACTION_HISTORY_LEN)
 
 
 def _image_tensor(

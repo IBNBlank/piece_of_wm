@@ -30,7 +30,7 @@ from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutRepl
 
 
 LOGGER = logging.getLogger("piece_of_wm.trans_wm_le")
-ARCHITECTURE_VERSION = 5
+ARCHITECTURE_VERSION = 7
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=10)
+    parser.add_argument("--planning-horizon", type=int, default=16)
     parser.add_argument("--evaluation-rollouts", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10, help="Offline pretraining epochs.")
     parser.add_argument(

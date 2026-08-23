@@ -1,4 +1,4 @@
-"""Deterministic image-history world model, independent of policy."""
+"""Variational image-history world model, independent of policy."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class LatentPosterior:
 
 
 class ImageHistoryEncoder(nn.Module):
-    """Stacks ten images on channels and parameterizes a VAE posterior."""
+    """Encodes a masked image-history window into an observation tensor."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
@@ -45,39 +45,69 @@ class ImageHistoryEncoder(nn.Module):
             dummy = torch.zeros(1, OBS_HISTORY_LEN * config.channels, config.height, config.width)
             encoded = self.cnn(dummy)
         self.encoded_shape = tuple(encoded.shape[1:])
-        self.to_statistics = nn.Sequential(
+        self.to_observation = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(prod(self.encoded_shape), 2 * config.latent_dim),
+            nn.Linear(prod(self.encoded_shape), config.observation_dim),
         )
-        self.latent_dim = config.latent_dim
 
-    def posterior(
-        self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor
-    ) -> LatentPosterior:
+    def forward(self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor) -> torch.Tensor:
         expected = (OBS_HISTORY_LEN, *self.observation_shape)
         if obs_history.shape[1:] != expected:
             raise ValueError(f"obs_history must have shape [batch, {expected}].")
         _validate_mask(obs_valid_mask, obs_history.shape[:2], obs_history.device, "obs_valid_mask")
         masked = obs_history * obs_valid_mask[:, :, None, None, None]
         stacked = masked.flatten(start_dim=1, end_dim=2)
-        mean, log_variance = self.to_statistics(self.cnn(stacked)).chunk(2, dim=-1)
+        return self.to_observation(self.cnn(stacked))
+
+
+class LatentEncoder(nn.Module):
+    """Fuses observation and preceding actions into a VAE posterior over z."""
+
+    def __init__(self, config: WorldModelConfig) -> None:
+        super().__init__()
+        self.observation_dim = config.observation_dim
+        self.action_history_dim = config.action_history_dim
+        self.to_statistics = nn.Sequential(
+            nn.Linear(config.observation_dim + config.action_history_dim, config.model_dim),
+            nn.GELU(),
+            nn.Linear(config.model_dim, 2 * config.latent_dim),
+        )
+
+    def posterior(
+        self, observation: torch.Tensor, action_history_tensor: torch.Tensor
+    ) -> LatentPosterior:
+        batch = observation.shape[0]
+        if observation.shape != (batch, self.observation_dim):
+            raise ValueError(
+                f"observation must have shape [batch, {self.observation_dim}]."
+            )
+        if action_history_tensor.shape != (batch, self.action_history_dim):
+            raise ValueError(
+                "action_history_tensor must have shape "
+                f"[batch, {self.action_history_dim}]."
+            )
+        if action_history_tensor.device != observation.device:
+            raise ValueError("observation and action history must be on the same device.")
+        mean, log_variance = self.to_statistics(
+            torch.cat((observation, action_history_tensor), dim=-1)
+        ).chunk(2, dim=-1)
         return LatentPosterior(mean, log_variance)
 
-    def forward(self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor) -> torch.Tensor:
-        return self.posterior(obs_history, obs_valid_mask).mean
+    def forward(
+        self, observation: torch.Tensor, action_history_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        return self.posterior(observation, action_history_tensor).mean
 
 
 class LatentDynamics(nn.Module):
-    """Predicts z(t+1) from [z(t), action-history, action(t)] tokens."""
+    """Predicts z(t+1) from [z(t), action(t)] tokens."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
         self.latent_dim = config.latent_dim
         self.action_dim = config.action_dim
-        self.action_history_dim = config.action_history_dim
-        self.position = nn.Parameter(torch.empty(1, 3, config.model_dim))
+        self.position = nn.Parameter(torch.empty(1, 2, config.model_dim))
         self.z_projection = nn.Linear(config.latent_dim, config.model_dim)
-        self.action_history_projection = nn.Linear(config.action_history_dim, config.model_dim)
         self.action_projection = nn.Linear(config.action_dim, config.model_dim)
         layer = nn.TransformerEncoderLayer(
             d_model=config.model_dim,
@@ -100,24 +130,18 @@ class LatentDynamics(nn.Module):
     def forward(
         self,
         z: torch.Tensor,
-        action_history_tensor: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
         batch = z.shape[0]
         if z.shape != (batch, self.latent_dim):
             raise ValueError(f"z must have shape [batch, {self.latent_dim}].")
-        if action_history_tensor.shape != (batch, self.action_history_dim):
-            raise ValueError(
-                f"action_history_tensor must have shape [batch, {self.action_history_dim}]."
-            )
         if action.shape != (batch, self.action_dim):
             raise ValueError(f"action must have shape [batch, {self.action_dim}].")
-        if action_history_tensor.device != z.device or action.device != z.device:
+        if action.device != z.device:
             raise ValueError("z and actions must be on the same device.")
         tokens = torch.cat(
             (
                 self.z_projection(z)[:, None],
-                self.action_history_projection(action_history_tensor)[:, None],
                 self.action_projection(action)[:, None],
             ),
             dim=1,
@@ -127,7 +151,7 @@ class LatentDynamics(nn.Module):
 
 
 class ImageHistoryDecoder(nn.Module):
-    """Decodes z into the ten channel-stacked images represented by that state."""
+    """Decodes z into the channel-stacked image history represented by that state."""
 
     def __init__(self, config: WorldModelConfig, encoded_shape: tuple[int, ...]) -> None:
         super().__init__()
@@ -226,15 +250,17 @@ class RolloutOutput:
 
 
 class WorldModel(nn.Module):
-    """CNN encoder, deterministic Transformer dynamics, heads, and action rollout."""
+    """Observation encoder, variational latent encoder, dynamics, and heads."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
         self.config = config
         self.encoder = ImageHistoryEncoder(config)
+        self.latent_encoder = LatentEncoder(config)
         self.dynamics = LatentDynamics(config)
         self.heads = WorldHeads(config, self.encoder.encoded_shape)
         self.ema_encoder = deepcopy(self.encoder).requires_grad_(False)
+        self.ema_latent_encoder = deepcopy(self.latent_encoder).requires_grad_(False)
         self.ema_dynamics = deepcopy(self.dynamics).requires_grad_(False)
         self.ema_heads = deepcopy(self.heads).requires_grad_(False)
         self._set_ema_eval()
@@ -246,18 +272,9 @@ class WorldModel(nn.Module):
 
     def _set_ema_eval(self) -> None:
         self.ema_encoder.eval()
+        self.ema_latent_encoder.eval()
         self.ema_dynamics.eval()
         self.ema_heads.eval()
-
-    def encode_online(
-        self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor
-    ) -> torch.Tensor:
-        return self.encoder(obs_history, obs_valid_mask)
-
-    @torch.no_grad()
-    def encode(self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor) -> torch.Tensor:
-        """Default policy-facing encoder backed by the frozen EMA model."""
-        return self.encode_ema(obs_history, obs_valid_mask)
 
     def action_history_tensor(
         self,
@@ -283,31 +300,71 @@ class WorldModel(nn.Module):
         masked = action_history * action_valid_mask[:, :, None]
         return masked.flatten(start_dim=1)
 
-    def predict_next_online(
+    def encode_observation_online(
+        self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor
+    ) -> torch.Tensor:
+        return self.encoder(obs_history, obs_valid_mask)
+
+    def posterior_online(
         self,
-        z: torch.Tensor,
+        obs_history: torch.Tensor,
+        obs_valid_mask: torch.Tensor,
         action_history: torch.Tensor,
-        action: torch.Tensor,
         action_valid_mask: torch.Tensor | None = None,
+    ) -> LatentPosterior:
+        observation = self.encoder(obs_history, obs_valid_mask)
+        ah = self._prepare_action_history(action_history, action_valid_mask)
+        return self.latent_encoder.posterior(observation, ah)
+
+    def encode_online(
+        self,
+        obs_history: torch.Tensor,
+        obs_valid_mask: torch.Tensor,
+        action_history: torch.Tensor,
+        action_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.posterior_online(
+            obs_history, obs_valid_mask, action_history, action_valid_mask
+        ).mean
+
+    @torch.no_grad()
+    def encode(
+        self,
+        obs_history: torch.Tensor,
+        obs_valid_mask: torch.Tensor,
+        action_history: torch.Tensor,
+        action_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.encode_ema(
+            obs_history, obs_valid_mask, action_history, action_valid_mask
+        )
+
+    def _prepare_action_history(
+        self,
+        action_history: torch.Tensor,
+        action_valid_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if action_history.ndim == 2:
             if action_valid_mask is not None:
                 raise ValueError("action_valid_mask is only used with unflattened action history.")
-            ah = action_history
-        else:
-            ah = self.action_history_tensor(action_history, action_valid_mask)
-        return self.dynamics(z, ah, action.flatten(start_dim=1))
+            return action_history
+        return self.action_history_tensor(action_history, action_valid_mask)
+
+    def predict_next_online(
+        self,
+        z: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.dynamics(z, action.flatten(start_dim=1))
 
     @torch.no_grad()
     def predict_next(
         self,
         z: torch.Tensor,
-        action_history: torch.Tensor,
         action: torch.Tensor,
-        action_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Default policy-facing dynamics prediction backed by EMA."""
-        return self.predict_next_ema(z, action_history, action, action_valid_mask)
+        return self.predict_next_ema(z, action)
 
     def predict_heads_online(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         return self.heads(z, action)
@@ -319,27 +376,25 @@ class WorldModel(nn.Module):
 
     @torch.no_grad()
     def encode_ema(
-        self, obs_history: torch.Tensor, obs_valid_mask: torch.Tensor
+        self,
+        obs_history: torch.Tensor,
+        obs_valid_mask: torch.Tensor,
+        action_history: torch.Tensor,
+        action_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Policy-facing encoder; always frozen, deterministic, and gradient-free."""
-        return self.ema_encoder(obs_history, obs_valid_mask)
+        observation = self.ema_encoder(obs_history, obs_valid_mask)
+        ah = self._prepare_action_history(action_history, action_valid_mask)
+        return self.ema_latent_encoder(observation, ah)
 
     @torch.no_grad()
     def predict_next_ema(
         self,
         z: torch.Tensor,
-        action_history: torch.Tensor,
         action: torch.Tensor,
-        action_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Policy-facing EMA dynamics prediction without gradient tracking."""
-        if action_history.ndim == 2:
-            if action_valid_mask is not None:
-                raise ValueError("action_valid_mask is only used with unflattened action history.")
-            ah = action_history
-        else:
-            ah = self.action_history_tensor(action_history, action_valid_mask)
-        return self.ema_dynamics(z, ah, action.flatten(start_dim=1))
+        return self.ema_dynamics(z, action.flatten(start_dim=1))
 
     @torch.no_grad()
     def predict_heads_ema(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
@@ -349,11 +404,9 @@ class WorldModel(nn.Module):
     def evaluate_action_online(
         self,
         z: torch.Tensor,
-        action_history: torch.Tensor,
         action: torch.Tensor,
-        action_valid_mask: torch.Tensor | None = None,
     ) -> ActionEvaluation:
-        next_z = self.predict_next_online(z, action_history, action, action_valid_mask)
+        next_z = self.predict_next_online(z, action)
         heads = HeadOutput(
             self.heads.observation_head(next_z),
             self.heads.reward(z, action),
@@ -364,23 +417,19 @@ class WorldModel(nn.Module):
     def evaluate_action(
         self,
         z: torch.Tensor,
-        action_history: torch.Tensor,
         action: torch.Tensor,
-        action_valid_mask: torch.Tensor | None = None,
     ) -> ActionEvaluation:
         """Default policy-facing action evaluation backed by EMA."""
-        return self.evaluate_action_ema(z, action_history, action, action_valid_mask)
+        return self.evaluate_action_ema(z, action)
 
     @torch.no_grad()
     def evaluate_action_ema(
         self,
         z: torch.Tensor,
-        action_history: torch.Tensor,
         action: torch.Tensor,
-        action_valid_mask: torch.Tensor | None = None,
     ) -> ActionEvaluation:
         """Scores an action using only frozen EMA modules."""
-        next_z = self.predict_next_ema(z, action_history, action, action_valid_mask)
+        next_z = self.predict_next_ema(z, action)
         heads = HeadOutput(
             self.ema_heads.observation_head(next_z),
             self.ema_heads.reward(z, action),
@@ -394,6 +443,7 @@ class WorldModel(nn.Module):
             raise ValueError("ema must be in [0, 1).")
         for target_module, online_module in (
             (self.ema_encoder, self.encoder),
+            (self.ema_latent_encoder, self.latent_encoder),
             (self.ema_dynamics, self.dynamics),
             (self.ema_heads, self.heads),
         ):
@@ -426,9 +476,7 @@ class WorldModel(nn.Module):
 
         latents, observations, rewards, scores = [], [], [], []
         for action in actions.unbind(dim=1):
-            evaluation = self.evaluate_action_online(
-                z, action_history, action, action_valid_mask
-            )
+            evaluation = self.evaluate_action_online(z, action)
             z = evaluation.next_z
             action_history, action_valid_mask = append_history(
                 action_history, action_valid_mask, action
@@ -478,9 +526,7 @@ class WorldModel(nn.Module):
             )
         latents, observations, rewards, scores = [], [], [], []
         for action in actions.unbind(dim=1):
-            evaluation = self.evaluate_action_ema(
-                z, action_history, action, action_valid_mask
-            )
+            evaluation = self.evaluate_action_ema(z, action)
             z = evaluation.next_z
             action_history, action_valid_mask = append_history(
                 action_history, action_valid_mask, action

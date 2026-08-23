@@ -12,7 +12,7 @@
 #   MAX_STEPS             : maximum episode steps (default: 200)
 #   DEVICE                : torch device; empty selects CUDA when available
 #   SEED                  : random seed (default: 0)
-#   PLANNING_HORIZON      : shared WM-training/planning horizon (default: 10)
+#   PLANNING_HORIZON      : shared WM-training/planning horizon (default: 16)
 #   NUM_PARTICLES         : planning particles (default: 1000)
 #   PARTICLE_UPDATES      : particle update iterations (default: 5)
 #   PARTICLE_SIGMA        : initial particle noise (default: 0.1)
@@ -50,7 +50,7 @@ NUM_ENVS="${NUM_ENVS:-10}"
 MAX_STEPS="${MAX_STEPS:-200}"
 DEVICE="${DEVICE:-}"
 SEED="${SEED:-0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-10}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-16}"
 NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
@@ -77,6 +77,11 @@ if [ "${PRETRAIN_OUTPUT_DIR}" = "${TRAIN_OUTPUT_DIR}" ]; then
 	echo "[run_integrate_trans_wm] error: pretraining and training output directories must differ" >&2
 	exit 1
 fi
+if [ -z "${PRETRAIN_RESUME}" ] \
+	&& compgen -G "${PRETRAIN_OUTPUT_DIR}/checkpoint_[0-9]*.pt" >/dev/null; then
+	PRETRAIN_RESUME="${PRETRAIN_OUTPUT_DIR}"
+	echo "[run_integrate_trans_wm] auto-resume pretraining from ${PRETRAIN_RESUME}"
+fi
 
 echo "[run_integrate_trans_wm] stage=pretrain output_dir=${PRETRAIN_OUTPUT_DIR}"
 env \
@@ -97,6 +102,11 @@ pretrained_checkpoint="${PRETRAIN_OUTPUT_DIR}/checkpoint_best.pt"
 if [ ! -f "${pretrained_checkpoint}" ]; then
 	echo "[run_integrate_trans_wm] error: pretraining did not produce ${pretrained_checkpoint}" >&2
 	exit 1
+fi
+if [ -z "${TRAIN_RESUME}" ] \
+	&& compgen -G "${TRAIN_OUTPUT_DIR}/checkpoint_[0-9]*.pt" >/dev/null; then
+	TRAIN_RESUME="${TRAIN_OUTPUT_DIR}"
+	echo "[run_integrate_trans_wm] auto-resume training from ${TRAIN_RESUME}"
 fi
 if [ -n "${TRAIN_RESUME}" ]; then
 	train_pretrained_checkpoint=""
