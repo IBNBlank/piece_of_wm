@@ -18,7 +18,7 @@
 #   PARTICLE_UPDATES        : particle resampling iterations per action (default: 5)
 #   PARTICLE_SIGMA          : particle perturbation standard deviation (default: 0.1)
 #   PARTICLE_TEMPERATURE    : softmax resampling temperature (default: 2.0)
-#   PLANNING_HORIZON        : model steps used for training and planning (default: 16)
+#   PLANNING_HORIZON        : model steps used for training and planning (default: 8)
 #   SEED                    : environment and policy seed
 #   DEVICE                  : torch device; empty selects CUDA when available
 #   OUTPUT                  : JSON results path
@@ -55,7 +55,7 @@ PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
 PARTICLE_TEMPERATURE="${PARTICLE_TEMPERATURE:-2.0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-16}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-8}"
 SEED="${SEED:-0}"
 DEVICE="${DEVICE:-}"
 OUTPUT="${OUTPUT:-runs/eval/results.json}"

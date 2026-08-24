@@ -174,7 +174,7 @@ Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 
 
 ## Heads 与 Action Score
 
-模型不包含 Observation Head、图像 decoder 或 Value Head。Reward Head 读取 128 维 latent 和当前 action。
+模型不包含 Observation Head 或图像 decoder。Reward Head 读取 128 维 latent 和当前 action，Value Head 从 latent 预测到 episode 结束的未折扣剩余回报。
 
 ### Reward Head
 
@@ -193,6 +193,15 @@ r_hat_t: [B, 1]
 
 因此 `r_hat_t` 表示执行 `a_t` 所对应的 transition reward，而不是进入 `z_t` 之前的 reward。
 
+### Value Head
+
+```text
+V_hat(z_t) = ValueHead(z_t)
+V_target(z_t) = sum_{j=t}^{episode end} r_j
+```
+
+训练时 Value Head 读取递归预测的下一 latent `z_hat_{t+k+1}`，目标为该状态之后的真实 reward-to-go；episode 最后一个状态的 target 为 0。
+
 ### Action Score
 
 外部 policy 的候选 action 先经过 Dynamics 得到下一 latent，再由两个 head 计算分数：
@@ -201,10 +210,10 @@ r_hat_t: [B, 1]
 z_hat_{t+1} = Dynamics(z_t, a_t)
 
 score(a_t:t+H-1)
-    = sum_k RewardHead(z_t+k, a_t+k)
+    = sum_k RewardHead(z_t+k, a_t+k) + EMAValueHead(z_t+H)
 ```
 
-规划器使用 EMA dynamics rollout 候选动作序列，直接累加多步预测 reward；不折扣，也不添加 terminal value。
+规划器使用 EMA dynamics rollout 候选动作序列，累加多步预测 reward，并在 horizon 末尾添加冻结的 EMA Value。reward sum 和 Value target 都不折扣。
 
 ## Padding 与 Mask
 
@@ -250,7 +259,7 @@ obs_t -> action_t -> obs_{t+1}
                     z_target_{t+1}
 ```
 
-`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 16 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
+`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 8 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
 
 ## 损失函数
 
@@ -339,6 +348,16 @@ L_reward(t) = (RewardHead(z_t, a_t) - r_t)^2
 
 第一步 Reward loss 更新 Encoder 和 Reward Head；后续步读取递归预测 latent，因此也会向 Dynamics 反传。Dynamics 同时由所有预测步的 JEPA loss 更新。
 
+### Value Loss
+
+```text
+L_value(t+k) = (ValueHead(z_hat_{t+k+1}) - sum_{j=t+k+1}^{episode end} r_j)^2
+```
+
+Value loss 使用完整 episode 计算 reward-to-go，即使 dynamics 训练和规划 horizon 较短，也能为末端 latent 提供更长程的回报信息。
+
+该 loss 只在正式训练阶段启用。预训练 replay 来自随机 policy，因此预训练固定 `value_weight = 0`，不计算 Value loss，也不更新 Value Head；正式训练默认使用 `value_weight = 1.0`。
+
 ### 总损失
 
 所有 horizon 内有效预测步等权，并按有效预测总数做 masked mean，因此增大 horizon 不会直接线性放大 loss。episode 尾部越界位置不参与更新。随后各项 loss 按配置权重相加：
@@ -348,9 +367,10 @@ L_total =
     jepa_weight   * L_JEPA
     + sigreg_weight * L_SIGReg
     + reward_weight * L_reward
+    + value_weight * L_value
 ```
 
-`jepa_weight` 和 `reward_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
+`jepa_weight`、`reward_weight` 和 `value_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
 
 ## EMA Target 与 Policy API
 
@@ -365,7 +385,7 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 - Observation Encoder；
 - Latent Encoder；
 - Latent Dynamics；
-- Reward Head。
+- Reward Head 和 Value Head。
 
 默认公共 API `encode`、`predict_next`、`predict_heads`、`evaluate_action` 和 `rollout` 使用冻结的 EMA 模块并禁用梯度。训练器显式调用对应的在线 API。
 
@@ -414,6 +434,7 @@ trainer = WorldModelTrainer(
     TrainingConfig(
         jepa_weight=1.0,
         sigreg_weight=0.2,
+        value_weight=1.0,
         sigreg_projections=256,
         sigreg_frequencies=17,
         sigreg_max_frequency=5.0,
@@ -434,10 +455,10 @@ z_t = model.encode(
 # Dynamics 只需要当前 128D latent 和当前 action。
 z_next = model.predict_next(z_t, action)
 
-# 从当前 latent 和 action 预测 transition reward。
+# 从当前 latent 预测 Value，并从当前 latent 和 action 预测 transition reward。
 heads = model.predict_heads(z_t, action)
 evaluation = model.evaluate_action(z_t, action)
-reward_score = evaluation.score
+one_step_score = evaluation.score  # reward(z_t, action) + EMA value(z_next)
 
 # 对外部 action sequence rollout，同时维护并返回 action history。
 rollout = model.rollout(
@@ -467,6 +488,7 @@ BATCH_SIZE=16 \
 DEVICE=cuda \
 JEPA_WEIGHT=1.0 \
 SIGREG_WEIGHT=0.2 \
+VALUE_WEIGHT=1.0 \
 ./run_train_trans_wm_le.sh
 ```
 
@@ -477,7 +499,8 @@ python -m trans_wm_le.train \
     --data-dir dataset \
     --output-dir runs/trans_wm_le \
     --jepa-weight 1.0 \
-    --sigreg-weight 0.2
+    --sigreg-weight 0.2 \
+    --value-weight 1.0
 ```
 
 数据目录需要包含 `dataset.json` 以及其中列出的 rollout `.npz` 文件。每个 rollout 文件必须包含：
@@ -489,5 +512,5 @@ obs, images, action, reward, terminated, truncated, lengths
 训练会保存模型配置、训练配置、optimizer 状态、NumPy/Torch RNG 状态以及 EMA 参数。日志指标包括：
 
 ```text
-total, jepa, sigreg, reward
+total, jepa, sigreg, reward, value
 ```

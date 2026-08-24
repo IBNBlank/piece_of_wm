@@ -18,10 +18,10 @@ flowchart TD
         TARGET --> JEPA
         ONLINE --> SIGREG["SIGReg"]
         SAMPLE --> REWARD["Reward MSE<br/>R(z_t, a_t) vs r_t"]
-        JEPA --> TOTAL["L = w_jepa L_jepa +<br/>w_sigreg L_sigreg + w_reward L_reward"]
+        JEPA --> TOTAL["L = w_jepa L_jepa + w_sigreg L_sigreg +<br/>w_reward L_reward + w_value L_value"]
         SIGREG --> TOTAL
         REWARD --> TOTAL
-        TOTAL --> WORLD_OPT["AdamW: encoder, latent encoder,<br/>dynamics, reward head"]
+        TOTAL --> WORLD_OPT["AdamW: encoder, latent encoder,<br/>dynamics, reward/value heads"]
     end
 
     WORLD_OPT --> EMA1["EMA update of all target modules"]
@@ -37,7 +37,7 @@ flowchart TD
 
 `run_pretrain_trans_wm_le.sh` 通过 `--pretrain` 进入纯 world-model 阶段。该阶段直接从 `DATA_DIR` 将源 rollout 加载到 RAM，不会在输出目录复制 replay 文件；随后按 epoch 打乱全部离线 transition，并以无放回 minibatch 完整遍历一次数据。它不会创建 Gym 环境或执行 particle policy。
 
-预训练使用固定 validation batch 的 `total` loss 选择 `checkpoint_best.pt`，并保留最近两个带 epoch 编号的 checkpoint。`RESUME` 用于恢复同一预训练阶段的完整 optimizer、epoch 计数器和 RNG 状态；正式训练则通过 `PRETRAINED_CHECKPOINT` 加载预训练模型和 optimizer，并重新初始化正式 rollout 计数、best return 和 RNG 状态。预训练 checkpoint 与正式训练 checkpoint 分别标记为 `phase=pretrain` 和 `phase=training`，不能混用 `RESUME`。
+预训练使用固定 validation batch 的 `total` loss 选择 `checkpoint_best.pt`，并保留最近两个带 epoch 编号的 checkpoint。由于 replay 来自随机 policy，预训练固定关闭 Value loss，Value Head 保持初始化状态。`RESUME` 用于恢复同一预训练阶段的完整 optimizer、epoch 计数器和 RNG 状态；正式训练则通过 `PRETRAINED_CHECKPOINT` 只加载预训练模型参数，并使用新的 optimizer、rollout 计数、best return 和 RNG 状态。预训练 checkpoint 与正式训练 checkpoint 分别标记为 `phase=pretrain` 和 `phase=training`，不能混用 `RESUME`。
 
 ## 模型与参数副本
 
@@ -87,16 +87,18 @@ sequenceDiagram
 
 ## Replay World-Model Update
 
-`train_transitions` 只更新在线 encoder、latent encoder、Transformer dynamics 和 reward head。它使用的损失是：
+正式训练的 `train_transitions` 更新在线 encoder、latent encoder、Transformer dynamics、reward head 和 Value head。预训练不计算其中的 Value loss。完整损失是：
 
 ```text
 L_JEPA   = mean((z_hat_{t+1} - stopgrad(z_target_{t+1}))^2)
 L_reward = mean((RewardHead(z_t, a_t) - r_t)^2)
+L_value = mean((ValueHead(z_hat_t+1) - return_to_go_t+1)^2)
 L_SIGReg = Gaussian-distribution regularization on online z_t and z_{t+1}
 
 L_world = jepa_weight * L_JEPA
         + sigreg_weight * L_SIGReg
         + reward_weight * L_reward
+        + value_weight * L_value
 ```
 
 `z_target_{t+1}` 仅由 EMA observation encoder 和 EMA latent encoder 得到，因此 JEPA 的 target 分支没有梯度。为了计算 SIGReg，代码还会在线编码真实的 `z_{t+1}`；这不是 dynamics 的 target，也不改变 JEPA 的 stop-gradient 语义。
@@ -118,7 +120,7 @@ repeat epochs_per_rollout times:
 
 ```
 
-`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机起点更新。每个起点按唯一的 `PLANNING_HORIZON` 递归预测连续多步，所有有效预测步等权归一化；同一参数也控制粒子搜索的 reward-sum horizon，默认值为 16。
+`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机起点更新。每个起点按唯一的 `PLANNING_HORIZON` 递归预测连续多步，所有有效预测步等权归一化；同一参数也控制粒子搜索的 reward-sum horizon，默认值为 8。
 
 ## 验证与 Checkpoint
 
@@ -135,7 +137,8 @@ repeat epochs_per_rollout times:
 
 | 训练阶段 | 数据来源 | 直接优化参数 | 不直接优化参数 |
 | --- | --- | --- | --- |
-| Replay world-model update | 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward head | 全部 EMA 模块 |
+| Pretrain replay update | 随机 policy 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward head | 全部 EMA 模块；Value head 保持初始化 |
+| Formal replay update | 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward/Value heads | 全部 EMA 模块 |
 | EMA update | 在线参数快照 | 无梯度参数滑动平均 | 不适用 |
 
 EMA 模块从不通过反向传播更新；它们仅由每次 optimizer step 后的滑动平均得到。

@@ -338,26 +338,22 @@ def restore_checkpoint(
 def load_pretrained_checkpoint(
     path: Path,
     model: Any,
-    trainer: Any,
     model_config: Any,
-    training_config: Any,
     device: torch.device,
     *,
     architecture_version: int,
     checkpoint: dict[str, Any] | None = None,
 ) -> None:
+    """Initializes model weights without carrying pretraining optimizer state forward."""
     if checkpoint is None:
         checkpoint = read_pretrained_checkpoint(
             path, device, architecture_version=architecture_version
         )
     if checkpoint["model_config"] != asdict(model_config):
         raise ValueError("Pretraining model configuration does not match CLI configuration.")
-    if checkpoint["training_config"] != asdict(training_config):
-        raise ValueError("Pretraining optimizer configuration does not match CLI configuration.")
     incompatible = model.load_state_dict(checkpoint["model"], strict=True)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise ValueError("Pretraining checkpoint world-model state is incomplete.")
-    trainer.optimizer.load_state_dict(checkpoint["optimizer"])
 
 
 def read_pretrained_checkpoint(

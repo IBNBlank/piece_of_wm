@@ -7,7 +7,7 @@
 - 当前图像历史和前序 action history 共同编码得到的 `z tensor`；
 - 最近 4 个已执行 action 组成的 action history。
 
-外部 policy 给出当前 action 后，Dynamics 直接预测确定性的下一个 `z tensor`。Heads 从 latent 预测 observation，并从当前 latent 与 action 预测 reward；模型不包含 Value head。
+外部 policy 给出当前 action 后，Dynamics 直接预测确定性的下一个 `z tensor`。Heads 从 latent 预测 observation 和未折扣剩余回报，并从当前 latent 与 action 预测 reward。
 
 ## 运行框架
 
@@ -58,11 +58,14 @@ flowchart LR
         DEC["CNN Decoder"]
         OH["重建的 5 张图像<br/>B x 5 x C x H x W"]
         RH["Reward Head<br/>r_hat"]
-        SCORE["multi-step score<br/>reward sum"]
+        VH["Value Head<br/>V_hat"]
+        SCORE["multi-step score<br/>reward sum + terminal Value"]
         ZN --> DEC --> OH
         SAMPLE -. 同窗口 VAE 重建 .-> DEC
         ZN --> RH
+        ZN --> VH
         RH --> SCORE
+        VH --> SCORE
     end
 
     ZN -->|直接替换当前 z| NEXT["下一 rollout step"]
@@ -173,6 +176,16 @@ r_hat_t = RewardHead(z_t, a_t)
 
 这与 Pendulum 在状态积分前由当前状态和 action 计算 reward 的时间语义一致。
 
+### Value Head
+
+Value Head 从 latent 预测该状态到 episode 结束的未折扣剩余回报：
+
+```text
+V_target(z_t) = sum_{j=t}^{episode end} r_j
+```
+
+训练时 Value Head 读取递归预测的 `z_hat_{t+k+1}`，其目标为从该状态开始的真实 reward-to-go；episode 最后状态的 target 为 0。
+
 ### Action Score
 
 外部 policy 的 action 先经过 Dynamics 得到下一个状态，再通过 Heads 计算分数：
@@ -181,10 +194,10 @@ r_hat_t = RewardHead(z_t, a_t)
 z_hat_{t+1} = Dynamics(z_t, a_t)
 
 score(a_t:t+H-1)
-    = sum_k reward_hat(z_t+k, a_t+k)
+    = sum_k reward_hat(z_t+k, a_t+k) + EMAValueHead(z_t+H)
 ```
 
-规划器使用 EMA dynamics rollout 候选动作序列，直接累加多步预测 reward；不折扣，也不添加 terminal value。
+规划器使用 EMA dynamics rollout 候选动作序列，累加多步预测 reward，并只在 horizon 末尾添加一次冻结的 EMA Value。reward sum 和 Value target 都不折扣。
 
 ## Padding 与 Mask
 
@@ -231,6 +244,16 @@ L_obs(t) = mean((observation_hat_history(z_hat_{t+1}) - observation_history_{t+1
 L_reward(t) = (reward_hat(z_t, a_t) - r_t)^2
 ```
 
+### Value 损失
+
+```text
+L_value(t+k) = (ValueHead(z_hat_{t+k+1}) - sum_{j=t+k+1}^{episode end} r_j)^2
+```
+
+Value target 使用完整 episode 的 reward-to-go，为短 horizon rollout 的末端 latent 提供长程回报信息。
+
+该 loss 只在正式训练阶段启用。预训练 replay 来自随机 policy，因此预训练固定 `value_weight = 0`，不计算 Value loss，也不更新 Value Head；正式训练默认使用 `value_weight = 1.0`。
+
 ### 同窗口 VAE 辅助任务
 
 Variational Latent Encoder 对每一个真实 state 的图像窗口与对齐 action history 输出 VAE posterior：
@@ -259,7 +282,7 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 
 ### 总损失
 
-训练从每个采样起点按唯一的 `PLANNING_HORIZON` 递归展开 Dynamics，默认 16 步。第 `k+1` 步使用第 `k` 步预测 latent，而不是重新编码真实状态作为 Dynamics 输入。所有有效预测步等权并按有效预测总数归一化；episode 尾部不足 horizon 的部分由 mask 排除。
+训练从每个采样起点按唯一的 `PLANNING_HORIZON` 递归展开 Dynamics，默认 8 步。第 `k+1` 步使用第 `k` 步预测 latent，而不是重新编码真实状态作为 Dynamics 输入。所有有效预测步等权并按有效预测总数归一化；episode 尾部不足 horizon 的部分由 mask 排除。
 
 所有 loss 先在有效 rollout step/window 上做 masked mean，再按配置权重相加：
 
@@ -267,11 +290,12 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 L_total =
     observation_weight * L_obs
     + reward_weight * L_reward
+    + value_weight * L_value
     + vae_reconstruction_weight * L_vae_recon
     + vae_kl_weight * L_vae_kl
 ```
 
-默认 `vae_reconstruction_weight = 1.0`，`vae_kl_weight = 1e-4`。
+默认 `value_weight = 1.0`、`vae_reconstruction_weight = 1.0`，`vae_kl_weight = 1e-4`。
 
 ## Policy 使用 EMA 模型
 
@@ -308,12 +332,12 @@ metrics = trainer.train_batch(replay_buffer.sample())
 z_t = model.encode(obs_history, obs_valid_mask, action_history, action_valid_mask)
 z_next = model.predict_next(z_t, action)
 
-# 直接从 z 预测 5 张图像，并从 (z, action) 预测 reward。
+# 直接从 z 预测 5 张图像和 Value，并从 (z, action) 预测 reward。
 heads = model.predict_heads(z_t, action)
 
-# 预测 action-conditioned next state 及当前 transition reward。
+# 预测 action-conditioned next state、当前 transition reward 及下一状态 Value。
 evaluation = model.evaluate_action(z_t, action)
-reward_score = evaluation.score
+one_step_score = evaluation.score
 
 # 对外部 action sequence rollout，只维护 action history。
 rollout = model.rollout(

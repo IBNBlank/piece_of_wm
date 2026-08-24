@@ -30,7 +30,7 @@ from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutRepl
 
 
 LOGGER = logging.getLogger("piece_of_wm.trans_wm")
-ARCHITECTURE_VERSION = 7
+ARCHITECTURE_VERSION = 8
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=16)
+    parser.add_argument("--planning-horizon", type=int, default=8)
     parser.add_argument("--evaluation-rollouts", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10, help="Offline pretraining epochs.")
     parser.add_argument(
@@ -101,6 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
+    parser.add_argument("--value-weight", type=float, default=1.0)
     parser.add_argument("--vae-reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--vae-kl-weight", type=float, default=1e-4)
     parser.add_argument("--verbose", action="store_true")
@@ -148,6 +149,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
+        value_weight=0.0 if args.pretrain else args.value_weight,
         vae_reconstruction_weight=args.vae_reconstruction_weight,
         vae_kl_weight=args.vae_kl_weight,
         planning_horizon=args.planning_horizon,
@@ -172,9 +174,7 @@ def main() -> None:
         _load_pretrained_checkpoint(
             args.pretrained_checkpoint,
             model,
-            trainer,
             model_config,
-            training_config,
             device,
         )
         LOGGER.info("Initialized world model from %s.", args.pretrained_checkpoint)

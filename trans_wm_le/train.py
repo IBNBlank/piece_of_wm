@@ -30,7 +30,7 @@ from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutRepl
 
 
 LOGGER = logging.getLogger("piece_of_wm.trans_wm_le")
-ARCHITECTURE_VERSION = 7
+ARCHITECTURE_VERSION = 8
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=16)
+    parser.add_argument("--planning-horizon", type=int, default=8)
     parser.add_argument("--evaluation-rollouts", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10, help="Offline pretraining epochs.")
     parser.add_argument(
@@ -99,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
     parser.add_argument("--jepa-weight", type=float, default=1.0)
     parser.add_argument("--sigreg-weight", type=float, default=0.2)
+    parser.add_argument("--value-weight", type=float, default=1.0)
     parser.add_argument("--sigreg-projections", type=int, default=256)
     parser.add_argument("--sigreg-frequencies", type=int, default=17)
     parser.add_argument("--sigreg-max-frequency", type=float, default=5.0)
@@ -150,6 +151,7 @@ def main() -> None:
         grad_clip_norm=args.grad_clip_norm,
         jepa_weight=args.jepa_weight,
         sigreg_weight=args.sigreg_weight,
+        value_weight=0.0 if args.pretrain else args.value_weight,
         sigreg_projections=args.sigreg_projections,
         sigreg_frequencies=args.sigreg_frequencies,
         sigreg_max_frequency=args.sigreg_max_frequency,
@@ -175,9 +177,7 @@ def main() -> None:
         _load_pretrained_checkpoint(
             args.pretrained_checkpoint,
             model,
-            trainer,
             model_config,
-            training_config,
             device,
             checkpoint=pretrained_checkpoint,
         )

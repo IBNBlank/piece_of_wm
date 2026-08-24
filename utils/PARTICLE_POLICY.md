@@ -83,6 +83,6 @@ action = torch.gather(particles, 1, best_indices[:, None, None]).squeeze(1)
 
 ## 10-step horizon
 
-唯一的 `PLANNING_HORIZON` 默认为 10，并同时控制 world-model 递归训练和粒子规划。规划器对 10 步预测 reward 直接求和；训练器对同样 10 步内的有效预测 loss 等权归一化。每轮 sigma 减少 `1/10`，最低保持为 `1/10`。
+唯一的 `PLANNING_HORIZON` 默认为 8，并同时控制 world-model 递归训练和粒子规划。规划器累加 8 步预测 reward，并在最后添加 EMA Value；训练器对同样 8 步内的有效预测 loss 等权归一化。每轮 sigma 减少 `1/8`，最低保持为 `1/8`。
 
 默认使用 1000 个粒子和 5 次 update；两者分别由 `NUM_PARTICLES` 和 `PARTICLE_UPDATES` 配置，与 horizon 无关。Temperature 默认是 2。若 `softmax(sum_reward / temperature)` 的有效样本数明显下降，可提高 temperature；当前策略仍然没有上一轮序列左移 warm start，也不拟合 CEM 式均值和方差。

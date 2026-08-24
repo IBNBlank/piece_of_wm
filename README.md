@@ -44,7 +44,8 @@ each stage's output directory. Explicit `PRETRAIN_RESUME` and `TRAIN_RESUME`
 values take precedence. Use a new output directory for a fresh run.
 
 Pretraining uses replay updates only. It does not create a Gym environment or
-run the particle policy. Validation loss selects
+run the particle policy, and it keeps the Value loss disabled because the replay
+data comes from a random policy. Validation loss selects
 `checkpoint_best.pt`; the two newest numbered checkpoints are retained for
 `RESUME`-based pretraining continuation. `EPOCHS` controls complete passes over
 all valid offline transitions; transitions are shuffled and visited exactly
@@ -62,11 +63,10 @@ PRETRAINED_CHECKPOINT=runs/trans_wm_le_pretrain/checkpoint_best.pt \
 ./run_train_trans_wm_le.sh
 ```
 
-`PRETRAINED_CHECKPOINT` restores the model and world optimizer, but starts the
-formal rollout counter, RNG streams, and best-return tracking
+`PRETRAINED_CHECKPOINT` restores only current-architecture model weights; the
+formal optimizer, rollout counter, RNG streams, and best-return tracking start
 fresh. `RESUME` instead restores the complete state of the same phase. The two
-options are mutually exclusive, and model/training configuration must match
-the checkpoint.
+options are mutually exclusive, and the model configuration must match the checkpoint.
 
 To train the CNN/Transformer world model without a
 pretraining phase, run:
@@ -108,21 +108,19 @@ training unit combines two randomly selected complete rollout batches by
 default (`SAMPLE_ROLLOUTS=2`) before sampling transitions. Periodic evaluation
 uses a fixed transition sample.
 
-Replay updates train the encoder, dynamics, and action-conditioned reward model
-`R(z_t, a_t)`. Particle planning scores candidates by directly summing multi-step
-predicted rewards; there is no discount, value head, or critic update. Every 10 training rollouts, the
+Replay updates train the encoder, dynamics, action-conditioned reward model
+`R(z_t, a_t)`, and an undiscounted return Value head for both models. Their particle
+planning score sums multi-step predicted rewards and adds the EMA Value at the
+final predicted latent. Every 10 training rollouts, the
 policy is evaluated over 10 separate episodes. The two newest numbered
 checkpoints are retained for resuming, while `checkpoint_best.pt` retains the
 highest evaluation return.
 
 World-model updates use the same `PLANNING_HORIZON` as policy evaluation. Its
-default is 16. From
+default is 8. From
 each sampled starting state, dynamics is recursively unrolled over consecutive
 dataset actions. Every valid prediction step contributes equally to the
 normalized loss; episode-tail padding is masked and no discount is applied.
-
-Checkpoints from the previous value-head architecture are rejected explicitly
-and must be retrained from scratch.
 
 ## Online evaluation
 
@@ -139,5 +137,5 @@ EPISODES=5 DEVICE=cuda \
 
 Results include per-episode online returns, a same-seed random-policy baseline,
 an online return plot, and a GIF recorded from the first environment episode.
-The default `PLANNING_HORIZON` is sixteen model steps and is shared by recursive
+The default `PLANNING_HORIZON` is eight model steps and is shared by recursive
 world-model training and particle planning.

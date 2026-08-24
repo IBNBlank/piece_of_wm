@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=16)
+    parser.add_argument("--planning-horizon", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None, help="Defaults to CUDA when available.")
     parser.add_argument("--output", type=Path, default=Path("runs/eval/results.json"))
@@ -141,7 +141,7 @@ def load_model(model_name: str, checkpoint_path: Path, device: torch.device) -> 
         raise FileNotFoundError(f"Checkpoint not found for {model_name}: {checkpoint_path}")
     package = importlib.import_module(model_name)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    expected_version = {"trans_wm": 7, "trans_wm_le": 7}[model_name]
+    expected_version = {"trans_wm": 8, "trans_wm_le": 8}[model_name]
     if checkpoint.get("architecture_version") != expected_version:
         raise ValueError(
             f"{checkpoint_path} is incompatible with the current model architecture; "
@@ -356,6 +356,9 @@ def score_particles(
             first_rewards = rewards
         scores = scores + rewards
         repeated_latent = model.predict_next_ema(repeated_latent, flat_actions)
+    scores = scores + model.ema_heads.value(repeated_latent).reshape(
+        batch_size, num_particles
+    )
     return scores, first_rewards
 
 

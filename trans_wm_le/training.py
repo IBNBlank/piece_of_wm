@@ -23,10 +23,11 @@ class TrainingConfig:
     jepa_weight: float = 1.0
     sigreg_weight: float = 0.2
     reward_weight: float = 1.0
+    value_weight: float = 1.0
     sigreg_projections: int = 256
     sigreg_frequencies: int = 17
     sigreg_max_frequency: float = 5.0
-    planning_horizon: int = 16
+    planning_horizon: int = 8
 
     def __post_init__(self) -> None:
         if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
@@ -41,6 +42,7 @@ class TrainingConfig:
                 self.jepa_weight,
                 self.sigreg_weight,
                 self.reward_weight,
+                self.value_weight,
             )
         ):
             raise ValueError("Loss weights must be non-negative.")
@@ -55,6 +57,7 @@ class TensorEpisodeBatch:
     observations: torch.Tensor  # [B, T + 1, C, H, W]
     actions: torch.Tensor  # [B, T, action_dim]
     rewards: torch.Tensor  # [B, T, 1]
+    returns: torch.Tensor  # [B, T + 1, 1]
     terminated: torch.Tensor  # [B, T]
     transition_valid: torch.Tensor  # [B, T]
     state_valid: torch.Tensor  # [B, T + 1]
@@ -68,6 +71,7 @@ class TensorTransitionBatch:
     action_valid: torch.Tensor  # [B, 4]
     actions: torch.Tensor  # [B, P, action_dim]
     rewards: torch.Tensor  # [B, P, 1]
+    next_returns: torch.Tensor  # [B, P, 1]
     terminated: torch.Tensor  # [B, P]
     transition_valid: torch.Tensor  # [B, P]
 
@@ -122,6 +126,7 @@ class WorldModelLosses:
     jepa: torch.Tensor
     sigreg: torch.Tensor
     reward: torch.Tensor
+    value: torch.Tensor
 
     def detached(self) -> dict[str, float]:
         return {
@@ -129,6 +134,7 @@ class WorldModelLosses:
             "jepa": self.jepa.detach().item(),
             "sigreg": self.sigreg.detach().item(),
             "reward": self.reward.detach().item(),
+            "value": self.value.detach().item(),
         }
 
 
@@ -147,8 +153,9 @@ def tensor_episode_batch(batch: EpisodeBatch, model: WorldModel) -> TensorEpisod
     time = actions.shape[1]
     transition_valid = torch.arange(time, device=device)[None] < lengths[:, None]
     state_valid = torch.arange(time + 1, device=device)[None] <= lengths[:, None]
+    returns = _returns_to_go(rewards, transition_valid)
     return TensorEpisodeBatch(
-        observations, actions, rewards, terminated, transition_valid, state_valid
+        observations, actions, rewards, returns, terminated, transition_valid, state_valid
     )
 
 
@@ -206,6 +213,7 @@ def transition_batch_from_indices(
         (batch_size, planning_horizon, *action_shape), dtype=batch.action.dtype
     )
     rewards = np.zeros((batch_size, planning_horizon, 1), dtype=batch.reward.dtype)
+    next_returns = np.zeros((batch_size, planning_horizon, 1), dtype=batch.reward.dtype)
     terminated = np.zeros((batch_size, planning_horizon), dtype=bool)
     transition_valid = np.zeros((batch_size, planning_horizon), dtype=bool)
 
@@ -230,6 +238,9 @@ def transition_batch_from_indices(
             transition = int(timestep + offset)
             actions[sample, offset] = batch.action[episode, transition]
             rewards[sample, offset, 0] = batch.reward[episode, transition]
+            next_returns[sample, offset, 0] = batch.reward[
+                episode, transition + 1 : lengths[episode]
+            ].sum()
             terminated[sample, offset] = batch.terminated[episode, transition]
             transition_valid[sample, offset] = True
 
@@ -242,6 +253,7 @@ def transition_batch_from_indices(
         torch.as_tensor(action_valid, device=device),
         torch.as_tensor(actions, device=device, dtype=dtype).flatten(start_dim=2),
         torch.as_tensor(rewards, device=device, dtype=dtype),
+        torch.as_tensor(next_returns, device=device, dtype=dtype),
         torch.as_tensor(terminated, device=device),
         torch.as_tensor(transition_valid, device=device),
     )
@@ -336,6 +348,7 @@ def world_model_loss(
     rollout_z = online_latents[:, :-1]
     jepa_errors = []
     reward_errors = []
+    value_errors = []
     rollout_valid = []
     rollout_steps = min(config.planning_horizon, batch.actions.shape[1])
     for offset in range(rollout_steps):
@@ -353,6 +366,15 @@ def world_model_loss(
         reward_errors.append(
             (predicted_reward - batch.rewards[:, offset:]).square().squeeze(-1)
         )
+        if config.value_weight > 0.0:
+            value_errors.append(
+                (
+                    model.heads.value(predicted_next_z.flatten(0, 1)).reshape(
+                        *predicted_next_z.shape[:2], 1
+                    )
+                    - batch.returns[:, offset + 1 :]
+                ).square().squeeze(-1)
+            )
         rollout_valid.append(step_valid)
         rollout_z = predicted_next_z[:, :-1]
 
@@ -365,6 +387,11 @@ def world_model_loss(
     reward = _masked_mean(
         torch.cat([item.flatten() for item in reward_errors]), valid
     )
+    value = (
+        _masked_mean(torch.cat([item.flatten() for item in value_errors]), valid)
+        if value_errors
+        else reward.new_zeros(())
+    )
     sigreg = sigreg_loss(
         online_latents[batch.state_valid],
         config.sigreg_projections,
@@ -375,8 +402,9 @@ def world_model_loss(
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
+        + config.value_weight * value
     )
-    return WorldModelLosses(total, jepa, sigreg, reward)
+    return WorldModelLosses(total, jepa, sigreg, reward, value)
 
 
 def transition_world_model_loss(
@@ -434,6 +462,7 @@ def transition_world_model_loss(
     rollout_z = current_z
     jepa_errors = []
     reward_errors = []
+    value_errors = []
     for offset in range(batch.actions.shape[1]):
         action = batch.actions[:, offset]
         reward_errors.append(
@@ -443,6 +472,12 @@ def transition_world_model_loss(
         )
         rollout_z = model.predict_next_online(rollout_z, action)
         jepa_errors.append((rollout_z - target_z[:, offset]).square().mean(dim=-1))
+        if config.value_weight > 0.0:
+            value_errors.append(
+                (model.heads.value(rollout_z) - batch.next_returns[:, offset])
+                .square()
+                .squeeze(-1)
+            )
     valid = batch.transition_valid.flatten().to(dtype=current_z.dtype)
     jepa = _masked_mean(torch.stack(jepa_errors, dim=1).flatten(), valid)
     sigreg = sigreg_loss(
@@ -452,12 +487,18 @@ def transition_world_model_loss(
         config.sigreg_max_frequency,
     )
     reward = _masked_mean(torch.stack(reward_errors, dim=1).flatten(), valid)
+    value = (
+        _masked_mean(torch.stack(value_errors, dim=1).flatten(), valid)
+        if value_errors
+        else reward.new_zeros(())
+    )
     total = (
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
+        + config.value_weight * value
     )
-    return WorldModelLosses(total, jepa, sigreg, reward)
+    return WorldModelLosses(total, jepa, sigreg, reward, value)
 
 
 class WorldModelTrainer:
@@ -644,3 +685,15 @@ def _masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     if count.item() == 0:
         raise ValueError("A training batch must contain at least one valid transition.")
     return (values * valid).sum() / count
+
+
+def _returns_to_go(rewards: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Returns undiscounted rewards following each state, with zero at episode end."""
+    masked_rewards = rewards * valid[:, :, None]
+    returns = torch.zeros(
+        (rewards.shape[0], rewards.shape[1] + 1, 1),
+        device=rewards.device,
+        dtype=rewards.dtype,
+    )
+    returns[:, :-1] = masked_rewards.flip(1).cumsum(1).flip(1)
+    return returns

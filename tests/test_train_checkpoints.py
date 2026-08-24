@@ -49,6 +49,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 grad_clip_norm=10.0,
                 jepa_weight=1.0,
                 sigreg_weight=0.2,
+                value_weight=1.0,
                 sigreg_projections=8,
                 sigreg_frequencies=4,
                 sigreg_max_frequency=5.0,
@@ -87,6 +88,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 trans_wm_le_train.main()
 
             run_pretraining.assert_called_once()
+            self.assertEqual(run_pretraining.call_args.args[4].value_weight, 0.0)
             make_env.assert_not_called()
 
     def test_training_cli_has_no_gamma(self) -> None:
@@ -105,7 +107,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertEqual(args.particle_updates, 5)
                 self.assertEqual(args.num_particles, 1000)
                 self.assertEqual(args.particle_temperature, 2.0)
-                self.assertEqual(args.planning_horizon, 16)
+                self.assertEqual(args.planning_horizon, 8)
 
     def test_rolling_checkpoints_keep_latest_two_and_resolve_latest(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
@@ -223,9 +225,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                     module._load_pretrained_checkpoint(
                         path,
                         model,
-                        trainer,
                         model_config,
-                        training_config,
                         torch.device("cpu"),
                     )
                 with self.assertRaisesRegex(ValueError, "Checkpoint phase"):
@@ -296,13 +296,11 @@ class TrainingCheckpointTest(unittest.TestCase):
                 module._load_pretrained_checkpoint(
                     path,
                     model,
-                    trainer,
                     model_config,
-                    training_config,
                     torch.device("cpu"),
                 )
                 self.assertIsNotNone(model.loaded)
-                self.assertIsNotNone(trainer.optimizer.loaded)
+                self.assertIsNone(trainer.optimizer.loaded)
 
     def test_pretraining_only_runs_replay_updates(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
@@ -367,10 +365,10 @@ class TrainingCheckpointTest(unittest.TestCase):
                 source_config.observation_shape,
                 source_config.action_shape,
             )
-            training_config = trans_wm_le_train.TrainingConfig()
+            pretraining_config = trans_wm_le_train.TrainingConfig(value_weight=0.0)
             source_model = trans_wm_le_train.WorldModel(source_config)
             source_trainer = trans_wm_le_train.WorldModelTrainer(
-                source_model, training_config
+                source_model, pretraining_config
             )
             replay_buffer = RolloutReplayBuffer.__new__(RolloutReplayBuffer)
             replay_buffer._rng = np.random.default_rng(2)
@@ -379,7 +377,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 source_model,
                 source_trainer,
                 source_config,
-                training_config,
+                pretraining_config,
                 np.random.default_rng(1),
                 replay_buffer,
                 torch.Generator().manual_seed(3),
@@ -391,15 +389,10 @@ class TrainingCheckpointTest(unittest.TestCase):
             )
 
             target_model = trans_wm_le_train.WorldModel(target_config)
-            target_trainer = trans_wm_le_train.WorldModelTrainer(
-                target_model, training_config
-            )
             trans_wm_le_train._load_pretrained_checkpoint(
                 path,
                 target_model,
-                target_trainer,
                 target_config,
-                training_config,
                 torch.device("cpu"),
             )
 

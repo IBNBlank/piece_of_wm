@@ -12,7 +12,7 @@
 #   MAX_STEPS             : maximum episode steps (default: 200)
 #   DEVICE                : torch device; empty selects CUDA when available
 #   SEED                  : random seed (default: 0)
-#   PLANNING_HORIZON      : shared WM-training/planning horizon (default: 16)
+#   PLANNING_HORIZON      : shared WM-training/planning horizon (default: 8)
 #   NUM_PARTICLES         : planning particles (default: 1000)
 #   PARTICLE_UPDATES      : particle update iterations (default: 5)
 #   PARTICLE_SIGMA        : initial particle noise (default: 0.1)
@@ -31,6 +31,7 @@
 #                          (default: runs/trans_wm_le)
 #   TRAIN_ROLLOUTS        : formal training units (default: 500)
 #   TRAIN_BATCH_SIZE      : replay minibatch size (default: 128)
+#   VALUE_WEIGHT          : terminal return Value loss weight (default: 1.0)
 #   TRAIN_RESUME          : formal checkpoint or run directory
 #   TRAIN_EXTRA_ARGS      : extra arguments for the formal training script
 #
@@ -50,7 +51,8 @@ NUM_ENVS="${NUM_ENVS:-20}"
 MAX_STEPS="${MAX_STEPS:-200}"
 DEVICE="${DEVICE:-}"
 SEED="${SEED:-0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-16}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-8}"
+VALUE_WEIGHT="${VALUE_WEIGHT:-1.0}"
 NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
@@ -123,6 +125,7 @@ env \
 	ROLLOUTS="${TRAIN_ROLLOUTS}" \
 	BATCH_SIZE="${TRAIN_BATCH_SIZE}" \
 	PLANNING_HORIZON="${PLANNING_HORIZON}" \
+	VALUE_WEIGHT="${VALUE_WEIGHT}" \
 	NUM_PARTICLES="${NUM_PARTICLES}" \
 	PARTICLE_UPDATES="${PARTICLE_UPDATES}" \
 	PARTICLE_SIGMA="${PARTICLE_SIGMA}" \

@@ -13,6 +13,7 @@ INITIAL_PARTICLE_SIGMA = (PENDULUM_ACTION_HIGH - PENDULUM_ACTION_LOW) / 4.0
 NUM_ACTION_PARTICLES = 1000
 DEFAULT_PARTICLE_SIGMA = 0.1
 DEFAULT_PARTICLE_TEMPERATURE = 2.0
+DEFAULT_PLANNING_HORIZON = 8
 
 
 class ParticlePolicy:
@@ -22,7 +23,11 @@ class ParticlePolicy:
     own reward model, then pass those scores to :meth:`update_particles`.
     """
 
-    def __init__(self, num_particles: int = NUM_ACTION_PARTICLES, horizon: int = 1) -> None:
+    def __init__(
+        self,
+        num_particles: int = NUM_ACTION_PARTICLES,
+        horizon: int = DEFAULT_PLANNING_HORIZON,
+    ) -> None:
         if isinstance(num_particles, bool) or not isinstance(num_particles, int):
             raise TypeError("num_particles must be an integer.")
         if num_particles <= 0:
