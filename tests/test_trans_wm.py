@@ -77,7 +77,7 @@ class WorldModelShapeTest(unittest.TestCase):
 
     def test_encoder_ignores_masked_image_values(self) -> None:
         images = torch.randn(2, OBS_HISTORY_LEN, 3, 32, 32)
-        mask = torch.tensor([[False] * 2 + [True] * 3, [True] * OBS_HISTORY_LEN])
+        mask = torch.tensor([[False, True, True], [True] * OBS_HISTORY_LEN])
         actions = torch.randn(2, ACTION_HISTORY_LEN, 2)
         changed = images.clone()
         changed[~mask] = 10000.0
@@ -105,13 +105,13 @@ class WorldModelShapeTest(unittest.TestCase):
 
     def test_action_history_is_one_flattened_ah_tensor(self) -> None:
         actions = torch.randn(2, ACTION_HISTORY_LEN, 2)
-        mask = torch.tensor([[False] * 2 + [True] * 2, [True] * ACTION_HISTORY_LEN])
+        mask = torch.tensor([[False, True], [True] * ACTION_HISTORY_LEN])
 
         ah = self.model.action_history_tensor(actions, mask)
 
         self.assertEqual(ah.shape, (2, ACTION_HISTORY_LEN * 2))
-        self.assertTrue(torch.equal(ah[0, :4], torch.zeros(4)))
-        torch.testing.assert_close(ah[0, -4:], actions[0, -2:].flatten())
+        self.assertTrue(torch.equal(ah[0, :2], torch.zeros(2)))
+        torch.testing.assert_close(ah[0, -2:], actions[0, -1].flatten())
         images = torch.randn(2, OBS_HISTORY_LEN, 3, 32, 32)
         image_mask = torch.ones(2, OBS_HISTORY_LEN, dtype=torch.bool)
         torch.testing.assert_close(
@@ -124,21 +124,22 @@ class WorldModelShapeTest(unittest.TestCase):
 
         self.assertEqual(output.observation.shape, (3, OBS_HISTORY_LEN, 3, 32, 32))
         self.assertEqual(output.reward.shape, (3, 1))
-        self.assertEqual(output.value.shape, (3, 1))
+        self.assertFalse(hasattr(output, "value"))
+        self.assertFalse(hasattr(self.model.heads, "value_head"))
 
-    def test_action_score_adds_ema_value_of_next_latent(self) -> None:
+    def test_action_score_is_predicted_reward(self) -> None:
         z = torch.randn(2, 128)
         action = torch.randn(2, 2)
 
         result = self.model.evaluate_action(z, action)
 
-        torch.testing.assert_close(result.score, result.heads.reward + result.heads.value)
+        torch.testing.assert_close(result.score, result.heads.reward)
         self.assertEqual(result.score.shape, (2, 1))
 
     def test_rollout_maintains_only_action_history(self) -> None:
         z = torch.randn(2, 128)
         action_history = torch.randn(2, ACTION_HISTORY_LEN, 2)
-        action_mask = torch.tensor([[False] * 2 + [True] * 2, [True] * ACTION_HISTORY_LEN])
+        action_mask = torch.tensor([[False, True], [True] * ACTION_HISTORY_LEN])
         actions = torch.randn(2, 3, 2)
 
         output = self.model.rollout(z, action_history, actions, action_mask)
@@ -150,41 +151,13 @@ class WorldModelShapeTest(unittest.TestCase):
         self.assertEqual(output.rewards.shape, (2, 3, 1))
         self.assertFalse(hasattr(output, "values"))
         self.assertEqual(output.scores.shape, (2, 3, 1))
-        torch.testing.assert_close(output.scores[:, :-1], output.rewards[:, :-1])
-        torch.testing.assert_close(
-            output.scores[:, -1],
-            output.rewards[:, -1] + self.model.ema_heads.value(output.final_z),
-        )
+        torch.testing.assert_close(output.scores, output.rewards)
         self.assertEqual(output.final_z.shape, (2, 128))
         self.assertEqual(output.final_action_history.shape, (2, ACTION_HISTORY_LEN, 2))
-        torch.testing.assert_close(output.final_action_history[:, -3:], actions)
+        torch.testing.assert_close(output.final_action_history, actions[:, -2:])
 
 
 class WorldModelTrainingTest(unittest.TestCase):
-    def test_zero_value_weight_keeps_online_and_ema_value_heads_frozen(self) -> None:
-        model = WorldModel(_config())
-        trainer = WorldModelTrainer(
-            model, TrainingConfig(value_weight=0.0, planning_horizon=3)
-        )
-        before = [
-            parameter.detach().clone()
-            for module in (model.heads.value_head, model.ema_heads.value_head)
-            for parameter in module.parameters()
-        ]
-
-        metrics = trainer.train_transitions(
-            _batch(), batch_size=3, rng=np.random.default_rng(5)
-        )
-
-        self.assertEqual(metrics["value"], 0.0)
-        after = [
-            parameter
-            for module in (model.heads.value_head, model.ema_heads.value_head)
-            for parameter in module.parameters()
-        ]
-        for actual, expected in zip(after, before, strict=True):
-            torch.testing.assert_close(actual, expected)
-
     def test_validation_epoch_visits_every_transition_once(self) -> None:
         trainer = WorldModelTrainer(WorldModel(_config()), TrainingConfig())
         batch = _batch()
@@ -230,12 +203,10 @@ class WorldModelTrainingTest(unittest.TestCase):
         self.assertEqual(on_update.call_count, 3)
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 
-    def test_value_head_predicts_scalar_from_latent(self) -> None:
+    def test_value_head_is_absent(self) -> None:
         model = WorldModel(_config())
-        value = model.heads.value(torch.randn(3, model.config.latent_dim))
-
-        self.assertEqual(value.shape, (3, 1))
-        self.assertEqual(model.heads.value_head[1].in_features, model.config.latent_dim)
+        self.assertFalse(hasattr(model.heads, "value"))
+        self.assertFalse(hasattr(model.heads, "value_head"))
 
     def test_reward_is_conditioned_on_current_latent_and_action(self) -> None:
         model = WorldModel(_config())
@@ -254,8 +225,8 @@ class WorldModelTrainingTest(unittest.TestCase):
             _batch(), model, batch_size=6, rng=np.random.default_rng(4), planning_horizon=10
         )
 
-        self.assertEqual(sampled.current_observations.shape, (6, 5, 3, 32, 32))
-        self.assertEqual(sampled.action_history.shape, (6, 4, 2))
+        self.assertEqual(sampled.current_observations.shape, (6, 3, 3, 32, 32))
+        self.assertEqual(sampled.action_history.shape, (6, 2, 2))
         torch.testing.assert_close(
             sampled.current_observations[:, 1:], sampled.next_observations[:, :-1]
         )
@@ -270,7 +241,7 @@ class WorldModelTrainingTest(unittest.TestCase):
         )
 
         self.assertEqual(sampled.actions.shape, (2, 3, 2))
-        self.assertEqual(sampled.target_observations.shape, (2, 3, 5, 3, 32, 32))
+        self.assertEqual(sampled.target_observations.shape, (2, 3, 3, 3, 32, 32))
         torch.testing.assert_close(
             sampled.next_returns.squeeze(-1),
             torch.tensor([[1.0, 0.0, 0.0], [9.0, 7.0, 4.0]]),
@@ -337,14 +308,13 @@ class WorldModelTrainingTest(unittest.TestCase):
         self.assertIsNotNone(model.encoder.to_observation[1].weight.grad)
         self.assertIsNotNone(model.latent_encoder.to_statistics[0].weight.grad)
         self.assertIsNotNone(model.dynamics.output[1].weight.grad)
-        self.assertIsNotNone(model.heads.value_head[1].weight.grad)
         model.zero_grad(set_to_none=True)
 
         metrics = WorldModelTrainer(model, config).train_batch(batch)
 
         self.assertEqual(
             set(metrics),
-            {"total", "observation", "reward", "value", "vae_reconstruction", "vae_kl"},
+            {"total", "observation", "reward", "vae_reconstruction", "vae_kl"},
         )
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 

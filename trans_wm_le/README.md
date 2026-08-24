@@ -6,8 +6,8 @@
 
 模型将表示明确分成两层：
 
-- 最近 5 帧图像经过 CNN 得到 `obs tensor`；
-- `obs tensor` 与最近 4 个已执行 action 组成的 `ah tensor` 经过小型 MLP，得到固定 128 维 `latent state`。
+- 最近 3 帧图像经过 CNN 得到 `obs tensor`；
+- `obs tensor` 与最近 2 个已执行 action 组成的 `ah tensor` 经过小型 MLP，得到固定 128 维 `latent state`。
 
 外部 policy 给出当前 action 后，Transformer Dynamics 根据当前 latent 和 action 预测下一个 latent。训练时，预测 latent 通过 JEPA loss 对齐由下一真实 observation 和更新后 action history 编码得到的 EMA target latent，并使用 SIGReg 防止表示坍塌。
 
@@ -16,9 +16,9 @@
 ```mermaid
 flowchart LR
     subgraph ObservationEncoder[Observation Encoder]
-        IM["最近 5 张图像<br/>B x 5 x C x H x W"]
-        OM["obs_valid_mask<br/>B x 5"]
-        STACK["屏蔽 padding<br/>沿 channel 拼接<br/>B x (5*C) x H x W"]
+        IM["最近 3 张图像<br/>B x 3 x C x H x W"]
+        OM["obs_valid_mask<br/>B x 3"]
+        STACK["屏蔽 padding<br/>沿 channel 拼接<br/>B x (3*C) x H x W"]
         CNN["多层 stride-2 CNN"]
         OBS["obs tensor<br/>B x observation_dim"]
         IM --> STACK
@@ -27,9 +27,9 @@ flowchart LR
     end
 
     subgraph ActionHistory[Action History]
-        A9["状态前最近 4 个 action<br/>B x 4 x A"]
-        AM["action_valid_mask<br/>B x 4"]
-        AH["屏蔽 padding 后拉直<br/>ah tensor: B x (4*A)"]
+        A9["状态前最近 2 个 action<br/>B x 2 x A"]
+        AM["action_valid_mask<br/>B x 2"]
+        AH["屏蔽 padding 后拉直<br/>ah tensor: B x (2*A)"]
         A9 --> AH
         AM -.-> AH
     end
@@ -76,7 +76,7 @@ flowchart LR
     Z --> SIG["SIGReg<br/>isotropic Gaussian regularization"]
 
     ZP -->|替换当前 latent| ROLLOUT["下一 rollout step"]
-    A -->|追加并保留最近 4 个| A9N["新的 action history"]
+    A -->|追加并保留最近 2 个| A9N["新的 action history"]
     A9N --> ROLLOUT
 
     ONLINE["online Encoder + Dynamics + Heads"] -->|EMA update| EMA["frozen EMA modules"]
@@ -88,14 +88,14 @@ flowchart LR
 Observation Encoder 输入固定为：
 
 ```text
-obs_history:    [B, 5, C, H, W]
-obs_valid_mask: [B, 5]
+obs_history:    [B, 3, C, H, W]
+obs_valid_mask: [B, 3]
 ```
 
-padding 位置先由 `obs_valid_mask` 清零，然后 5 张图像沿 channel 维拼接：
+padding 位置先由 `obs_valid_mask` 清零，然后 3 张图像沿 channel 维拼接：
 
 ```text
-[B, 5, C, H, W] -> [B, 5*C, H, W]
+[B, 3, C, H, W] -> [B, 3*C, H, W]
 ```
 
 拼接结果经过多层 stride-2 CNN，再通过 `Flatten + Linear` 得到：
@@ -106,29 +106,29 @@ obs_tensor_t: [B, observation_dim]
 
 这里的输出只是由图像历史得到的 observation representation，不再称为 `z tensor`。Encoder 是确定性的，不输出 mean、log-variance，也不进行 sampling。
 
-episode 开头不足 5 帧的位置使用零值左 padding，不重复第一帧。
+episode 开头不足 3 帧的位置使用零值左 padding，不重复第一帧。
 
 ## Action History
 
 状态 `t` 的 action history 只包含 `a_t` 之前已经执行的 action：
 
 ```text
-action_history_t: [B, 4, action_dim]
-action_valid_mask: [B, 4]
+action_history_t: [B, 2, action_dim]
+action_valid_mask: [B, 2]
 ```
 
 padding action 先由 `action_valid_mask` 清零，再拉直为一个整体的 `ah tensor`：
 
 ```text
-ah_t: [B, 4 * action_dim]
+ah_t: [B, 2 * action_dim]
 ```
 
-`action_history_tensor` 支持传入原始 history 和 mask。`encode` / `encode_online` 既支持原始 `[B,4,A]` history，也支持已经拉直的 `[B,4*A]` tensor；传入拉直 tensor 时不再额外传 mask。
+`action_history_tensor` 支持传入原始 history 和 mask。`encode` / `encode_online` 既支持原始 `[B,2,A]` history，也支持已经拉直的 `[B,2*A]` tensor；传入拉直 tensor 时不再额外传 mask。
 
 下一状态的 action history 必须包含当前 transition 的 action：
 
 ```text
-ah_{t+1} = append(ah_t, a_t)[-4:]
+ah_{t+1} = append(ah_t, a_t)[-2:]
 ```
 
 这一步同时用于真实下一 latent 的 JEPA target 编码，不能继续使用 `ah_t`，否则 observation 与 action history 会错位。
@@ -174,7 +174,7 @@ Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 
 
 ## Heads 与 Action Score
 
-模型不包含 Observation Head 或图像 decoder。Reward Head 读取 128 维 latent 和当前 action，Value Head 从 latent 预测到 episode 结束的未折扣剩余回报。
+模型不包含 Observation Head、图像 decoder 或 critic。Reward Head 读取 128 维 latent 和当前 action。
 
 ### Reward Head
 
@@ -193,38 +193,29 @@ r_hat_t: [B, 1]
 
 因此 `r_hat_t` 表示执行 `a_t` 所对应的 transition reward，而不是进入 `z_t` 之前的 reward。
 
-### Value Head
-
-```text
-V_hat(z_t) = ValueHead(z_t)
-V_target(z_t) = sum_{j=t}^{episode end} r_j
-```
-
-训练时 Value Head 读取递归预测的下一 latent `z_hat_{t+k+1}`，目标为该状态之后的真实 reward-to-go；episode 最后一个状态的 target 为 0。
-
 ### Action Score
 
-外部 policy 的候选 action 先经过 Dynamics 得到下一 latent，再由两个 head 计算分数：
+外部 policy 对候选 action sequence 递归预测 latent，并累加 Reward Head 的输出：
 
 ```text
 z_hat_{t+1} = Dynamics(z_t, a_t)
 
 score(a_t:t+H-1)
-    = sum_k RewardHead(z_t+k, a_t+k) + EMAValueHead(z_t+H)
+    = sum_k RewardHead(z_t+k, a_t+k)
 ```
 
-规划器使用 EMA dynamics rollout 候选动作序列，累加多步预测 reward，并在 horizon 末尾添加冻结的 EMA Value。reward sum 和 Value target 都不折扣。
+规划器不使用 critic 或 terminal value，reward sum 也不折扣。
 
 ## Padding 与 Mask
 
 图像历史和 action history 都使用零值左 padding：
 
 ```text
-images:      [PAD PAD PAD PAD PAD PAD PAD o0 o1 o2]
-image mask:  [ 0   0   0   0   0   0   0  1  1  1]
+images:      [PAD o0 o1]
+image mask:  [ 0  1  1]
 
-actions:     [PAD PAD PAD PAD PAD PAD PAD a0 a1]
-action mask: [ 0   0   0   0   0   0   0  1  1]
+actions:     [PAD a0]
+action mask: [ 0  1]
 ```
 
 mask 在进入 CNN 或 Latent Encoder 前显式清零 padding 值。训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition，并使用 `state_valid` 排除 SIGReg 中的无效状态。
@@ -259,7 +250,7 @@ obs_t -> action_t -> obs_{t+1}
                     z_target_{t+1}
 ```
 
-`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 8 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
+`train_batch` 在完整 episode tensor 上构造所有历史窗口并使用 mask；`train_transitions` 则采样有效起点，并构造从该起点开始、最长为 `PLANNING_HORIZON` 的连续 action/reward/目标窗口，默认 20 步。预测 latent 递归作为下一步 Dynamics 输入，真实未来窗口只用于构造 EMA target。
 
 ## 损失函数
 
@@ -348,16 +339,6 @@ L_reward(t) = (RewardHead(z_t, a_t) - r_t)^2
 
 第一步 Reward loss 更新 Encoder 和 Reward Head；后续步读取递归预测 latent，因此也会向 Dynamics 反传。Dynamics 同时由所有预测步的 JEPA loss 更新。
 
-### Value Loss
-
-```text
-L_value(t+k) = (ValueHead(z_hat_{t+k+1}) - sum_{j=t+k+1}^{episode end} r_j)^2
-```
-
-Value loss 使用完整 episode 计算 reward-to-go，即使 dynamics 训练和规划 horizon 较短，也能为末端 latent 提供更长程的回报信息。
-
-该 loss 只在正式训练阶段启用。预训练 replay 来自随机 policy，因此预训练固定 `value_weight = 0`，不计算 Value loss，也不更新 Value Head；正式训练默认使用 `value_weight = 1.0`。
-
 ### 总损失
 
 所有 horizon 内有效预测步等权，并按有效预测总数做 masked mean，因此增大 horizon 不会直接线性放大 loss。episode 尾部越界位置不参与更新。随后各项 loss 按配置权重相加：
@@ -367,10 +348,9 @@ L_total =
     jepa_weight   * L_JEPA
     + sigreg_weight * L_SIGReg
     + reward_weight * L_reward
-    + value_weight * L_value
 ```
 
-`jepa_weight`、`reward_weight` 和 `value_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
+`jepa_weight` 和 `reward_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss、VAE KL loss 或 critic loss。
 
 ## EMA Target 与 Policy API
 
@@ -385,7 +365,7 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 - Observation Encoder；
 - Latent Encoder；
 - Latent Dynamics；
-- Reward Head 和 Value Head。
+- Reward Head。
 
 默认公共 API `encode`、`predict_next`、`predict_heads`、`evaluate_action` 和 `rollout` 使用冻结的 EMA 模块并禁用梯度。训练器显式调用对应的在线 API。
 
@@ -434,7 +414,6 @@ trainer = WorldModelTrainer(
     TrainingConfig(
         jepa_weight=1.0,
         sigreg_weight=0.2,
-        value_weight=1.0,
         sigreg_projections=256,
         sigreg_frequencies=17,
         sigreg_max_frequency=5.0,
@@ -446,19 +425,19 @@ metrics = trainer.train_batch(replay_buffer.sample())
 
 # 默认 encode 使用冻结的 EMA Observation Encoder 和 Latent Encoder。
 z_t = model.encode(
-    obs_history,          # [B, 5, C, H, W]
-    obs_valid_mask,       # [B, 5]
-    action_history,       # [B, 4, action_dim]
-    action_valid_mask,    # [B, 4]
+    obs_history,          # [B, 3, C, H, W]
+    obs_valid_mask,       # [B, 3]
+    action_history,       # [B, 2, action_dim]
+    action_valid_mask,    # [B, 2]
 )
 
 # Dynamics 只需要当前 128D latent 和当前 action。
 z_next = model.predict_next(z_t, action)
 
-# 从当前 latent 预测 Value，并从当前 latent 和 action 预测 transition reward。
+# 从当前 latent 和 action 预测 transition reward。
 heads = model.predict_heads(z_t, action)
 evaluation = model.evaluate_action(z_t, action)
-one_step_score = evaluation.score  # reward(z_t, action) + EMA value(z_next)
+one_step_score = evaluation.score  # reward(z_t, action)
 
 # 对外部 action sequence rollout，同时维护并返回 action history。
 rollout = model.rollout(

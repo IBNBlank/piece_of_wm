@@ -39,13 +39,12 @@ DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
 ./run_integrate_trans_wm_le.sh
 ```
 
-The integrated runners automatically resume the newest numbered checkpoint in
-each stage's output directory. Explicit `PRETRAIN_RESUME` and `TRAIN_RESUME`
-values take precedence. Use a new output directory for a fresh run.
+The integrated runners start each stage from scratch by default. Set
+`PRETRAIN_RESUME` or `TRAIN_RESUME` explicitly to resume a checkpoint, and use a
+new output directory to keep a fresh run separate from previous artifacts.
 
 Pretraining uses replay updates only. It does not create a Gym environment or
-run the particle policy, and it keeps the Value loss disabled because the replay
-data comes from a random policy. Validation loss selects
+run the particle policy. Validation loss selects
 `checkpoint_best.pt`; the two newest numbered checkpoints are retained for
 `RESUME`-based pretraining continuation. `EPOCHS` controls complete passes over
 all valid offline transitions; transitions are shuffled and visited exactly
@@ -63,7 +62,7 @@ PRETRAINED_CHECKPOINT=runs/trans_wm_le_pretrain/checkpoint_best.pt \
 ./run_train_trans_wm_le.sh
 ```
 
-`PRETRAINED_CHECKPOINT` restores only current-architecture model weights; the
+`PRETRAINED_CHECKPOINT` restores only model weights; the
 formal optimizer, rollout counter, RNG streams, and best-return tracking start
 fresh. `RESUME` instead restores the complete state of the same phase. The two
 options are mutually exclusive, and the model configuration must match the checkpoint.
@@ -92,7 +91,7 @@ so the training configuration cannot silently disagree with the collected
 rollout layout.
 
 The script samples bounded transition batches from the sequence rollouts, so it
-does not materialize all five-frame windows for an entire dataset in memory. To
+does not materialize all three-frame windows for an entire dataset in memory. To
 continue from a checkpoint, set `RESUME` to a checkpoint file or the run
 directory and keep the matching model/training arguments in `EXTRA_ARGS`. A run
 directory automatically selects its newest numbered checkpoint:
@@ -108,10 +107,9 @@ training unit combines two randomly selected complete rollout batches by
 default (`SAMPLE_ROLLOUTS=2`) before sampling transitions. Periodic evaluation
 uses a fixed transition sample.
 
-Replay updates train the encoder, dynamics, action-conditioned reward model
-`R(z_t, a_t)`, and an undiscounted return Value head for both models. Their particle
-planning score sums multi-step predicted rewards and adds the EMA Value at the
-final predicted latent. Every 10 training rollouts, the
+Replay updates train the encoder, dynamics, and action-conditioned reward model
+`R(z_t, a_t)` for both models. Particle planning scores are the sums of multi-step
+predicted rewards, without a critic or terminal value bootstrap. Every 10 training rollouts, the
 policy is evaluated over 10 separate episodes. The two newest numbered
 checkpoints are retained for resuming, while `checkpoint_best.pt` retains the
 highest evaluation return.

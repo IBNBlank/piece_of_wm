@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import sys
 
 import numpy as np
 import torch
@@ -16,6 +17,11 @@ def configure_logging(verbose: bool = False) -> logging.Logger:
         force=True,
     )
     return logging.getLogger("piece_of_wm")
+
+
+def interactive_progress_enabled() -> bool:
+    """Return whether carriage-return progress rendering is supported."""
+    return sys.stderr.isatty()
 
 
 def seed_everything(seed: int) -> None:

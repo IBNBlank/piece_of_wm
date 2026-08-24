@@ -194,11 +194,10 @@ class ImageHistoryDecoder(nn.Module):
 class HeadOutput:
     observation: torch.Tensor
     reward: torch.Tensor
-    value: torch.Tensor
 
 
 class WorldHeads(nn.Module):
-    """Predicts observations, transition rewards, and latent-state values."""
+    """Predicts observations and transition rewards."""
 
     def __init__(self, config: WorldModelConfig, encoded_shape: tuple[int, ...]) -> None:
         super().__init__()
@@ -208,12 +207,6 @@ class WorldHeads(nn.Module):
         self.reward_head = nn.Sequential(
             nn.LayerNorm(config.latent_dim + config.action_dim),
             nn.Linear(config.latent_dim + config.action_dim, config.model_dim),
-            nn.GELU(),
-            nn.Linear(config.model_dim, 1),
-        )
-        self.value_head = nn.Sequential(
-            nn.LayerNorm(config.latent_dim),
-            nn.Linear(config.latent_dim, config.model_dim),
             nn.GELU(),
             nn.Linear(config.model_dim, 1),
         )
@@ -227,7 +220,6 @@ class WorldHeads(nn.Module):
         return HeadOutput(
             self.observation_head(z),
             self.reward_head(torch.cat((z, action), dim=-1)),
-            self.value_head(z),
         )
 
     def reward(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -237,12 +229,6 @@ class WorldHeads(nn.Module):
         if action.shape != (z.shape[0], self.action_dim):
             raise ValueError(f"action must have shape [batch, {self.action_dim}].")
         return self.reward_head(torch.cat((z, action), dim=-1))
-
-    def value(self, z: torch.Tensor) -> torch.Tensor:
-        if z.ndim != 2 or z.shape[1] != self.latent_dim:
-            raise ValueError(f"z must have shape [batch, {self.latent_dim}].")
-        return self.value_head(z)
-
 
 @dataclass(frozen=True)
 class ActionEvaluation:
@@ -411,7 +397,7 @@ class WorldModel(nn.Module):
 
     @torch.no_grad()
     def predict_heads_ema(self, z: torch.Tensor, action: torch.Tensor) -> HeadOutput:
-        """Policy-facing EMA observation, reward, and Value heads."""
+        """Policy-facing EMA observation and reward heads."""
         return self.ema_heads(z, action)
 
     def evaluate_action_online(
@@ -423,9 +409,8 @@ class WorldModel(nn.Module):
         heads = HeadOutput(
             self.heads.observation_head(next_z),
             self.heads.reward(z, action),
-            self.heads.value(next_z),
         )
-        return ActionEvaluation(next_z, heads, heads.reward + heads.value)
+        return ActionEvaluation(next_z, heads, heads.reward)
 
     @torch.no_grad()
     def evaluate_action(
@@ -447,9 +432,8 @@ class WorldModel(nn.Module):
         heads = HeadOutput(
             self.ema_heads.observation_head(next_z),
             self.ema_heads.reward(z, action),
-            self.ema_heads.value(next_z),
         )
-        return ActionEvaluation(next_z, heads, heads.reward + heads.value)
+        return ActionEvaluation(next_z, heads, heads.reward)
 
     @torch.no_grad()
     def update_target(self, ema: float | None = None) -> None:
@@ -500,7 +484,6 @@ class WorldModel(nn.Module):
             observations.append(evaluation.heads.observation)
             rewards.append(evaluation.heads.reward)
             scores.append(evaluation.heads.reward)
-        scores[-1] = scores[-1] + evaluation.heads.value
         return RolloutOutput(
             torch.stack(latents, dim=1),
             torch.stack(observations, dim=1),
@@ -551,7 +534,6 @@ class WorldModel(nn.Module):
             observations.append(evaluation.heads.observation)
             rewards.append(evaluation.heads.reward)
             scores.append(evaluation.heads.reward)
-        scores[-1] = scores[-1] + evaluation.heads.value
         return RolloutOutput(
             torch.stack(latents, dim=1),
             torch.stack(observations, dim=1),

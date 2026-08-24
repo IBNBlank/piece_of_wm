@@ -12,7 +12,7 @@
 #   MAX_STEPS             : maximum episode steps (default: 200)
 #   DEVICE                : torch device; empty selects CUDA when available
 #   SEED                  : random seed (default: 0)
-#   PLANNING_HORIZON      : shared WM-training/planning horizon (default: 8)
+#   PLANNING_HORIZON      : shared WM-training/planning horizon (default: 20)
 #   NUM_PARTICLES         : planning particles (default: 1000)
 #   PARTICLE_UPDATES      : particle update iterations (default: 5)
 #   PARTICLE_SIGMA        : initial particle noise (default: 0.1)
@@ -31,7 +31,6 @@
 #                          (default: runs/trans_wm)
 #   TRAIN_ROLLOUTS        : formal training units (default: 500)
 #   TRAIN_BATCH_SIZE      : replay minibatch size (default: 512)
-#   VALUE_WEIGHT          : terminal return Value loss weight (default: 1.0)
 #   TRAIN_RESUME          : formal checkpoint or run directory
 #   TRAIN_EXTRA_ARGS      : extra arguments for the formal training script
 #
@@ -51,8 +50,7 @@ NUM_ENVS="${NUM_ENVS:-10}"
 MAX_STEPS="${MAX_STEPS:-200}"
 DEVICE="${DEVICE:-}"
 SEED="${SEED:-0}"
-PLANNING_HORIZON="${PLANNING_HORIZON:-8}"
-VALUE_WEIGHT="${VALUE_WEIGHT:-1.0}"
+PLANNING_HORIZON="${PLANNING_HORIZON:-20}"
 NUM_PARTICLES="${NUM_PARTICLES:-1000}"
 PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
 PARTICLE_SIGMA="${PARTICLE_SIGMA:-0.1}"
@@ -79,12 +77,6 @@ if [ "${PRETRAIN_OUTPUT_DIR}" = "${TRAIN_OUTPUT_DIR}" ]; then
 	echo "[run_integrate_trans_wm] error: pretraining and training output directories must differ" >&2
 	exit 1
 fi
-if [ -z "${PRETRAIN_RESUME}" ] \
-	&& compgen -G "${PRETRAIN_OUTPUT_DIR}/checkpoint_[0-9]*.pt" >/dev/null; then
-	PRETRAIN_RESUME="${PRETRAIN_OUTPUT_DIR}"
-	echo "[run_integrate_trans_wm] auto-resume pretraining from ${PRETRAIN_RESUME}"
-fi
-
 echo "[run_integrate_trans_wm] stage=pretrain output_dir=${PRETRAIN_OUTPUT_DIR}"
 env \
 	DATA_DIR="${DATA_DIR}" \
@@ -105,11 +97,6 @@ if [ ! -f "${pretrained_checkpoint}" ]; then
 	echo "[run_integrate_trans_wm] error: pretraining did not produce ${pretrained_checkpoint}" >&2
 	exit 1
 fi
-if [ -z "${TRAIN_RESUME}" ] \
-	&& compgen -G "${TRAIN_OUTPUT_DIR}/checkpoint_[0-9]*.pt" >/dev/null; then
-	TRAIN_RESUME="${TRAIN_OUTPUT_DIR}"
-	echo "[run_integrate_trans_wm] auto-resume training from ${TRAIN_RESUME}"
-fi
 if [ -n "${TRAIN_RESUME}" ]; then
 	train_pretrained_checkpoint=""
 else
@@ -125,7 +112,6 @@ env \
 	ROLLOUTS="${TRAIN_ROLLOUTS}" \
 	BATCH_SIZE="${TRAIN_BATCH_SIZE}" \
 	PLANNING_HORIZON="${PLANNING_HORIZON}" \
-	VALUE_WEIGHT="${VALUE_WEIGHT}" \
 	NUM_PARTICLES="${NUM_PARTICLES}" \
 	PARTICLE_UPDATES="${PARTICLE_UPDATES}" \
 	PARTICLE_SIGMA="${PARTICLE_SIGMA}" \

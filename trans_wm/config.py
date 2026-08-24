@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from math import prod
 
 
-OBS_HISTORY_LEN = 5
-ACTION_HISTORY_LEN = 4
+OBS_HISTORY_LEN = 3
+ACTION_HISTORY_LEN = 2
 
 
 @dataclass(frozen=True)

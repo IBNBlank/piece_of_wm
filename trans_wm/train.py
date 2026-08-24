@@ -23,34 +23,28 @@ from trans_wm import (
     WorldModelTrainer,
 )
 from utils import training_runtime
-from utils.common import configure_logging, seed_everything
+from utils.common import (
+    configure_logging,
+    interactive_progress_enabled,
+    seed_everything,
+)
 from utils.env import make_env
 from utils.particle_policy import ParticlePolicy
 from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutReplayBuffer
 
 
 LOGGER = logging.getLogger("piece_of_wm.trans_wm")
-ARCHITECTURE_VERSION = 8
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
     training_runtime.run_pretraining,
-    architecture_version=ARCHITECTURE_VERSION,
     description="Pretraining Trans-WM",
     logger=LOGGER,
 )
-_save_checkpoint = partial(
-    training_runtime.save_checkpoint, architecture_version=ARCHITECTURE_VERSION
-)
-_save_rolling_checkpoint = partial(
-    training_runtime.save_rolling_checkpoint, architecture_version=ARCHITECTURE_VERSION
-)
-_restore_checkpoint = partial(
-    training_runtime.restore_checkpoint, architecture_version=ARCHITECTURE_VERSION
-)
-_load_pretrained_checkpoint = partial(
-    training_runtime.load_pretrained_checkpoint, architecture_version=ARCHITECTURE_VERSION
-)
+_save_checkpoint = training_runtime.save_checkpoint
+_save_rolling_checkpoint = training_runtime.save_rolling_checkpoint
+_restore_checkpoint = training_runtime.restore_checkpoint
+_load_pretrained_checkpoint = training_runtime.load_pretrained_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
     parser.add_argument("--particle-temperature", type=float, default=2.0)
-    parser.add_argument("--planning-horizon", type=int, default=8)
+    parser.add_argument("--planning-horizon", type=int, default=20)
     parser.add_argument("--evaluation-rollouts", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10, help="Offline pretraining epochs.")
     parser.add_argument(
@@ -101,7 +95,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
-    parser.add_argument("--value-weight", type=float, default=1.0)
     parser.add_argument("--vae-reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--vae-kl-weight", type=float, default=1e-4)
     parser.add_argument("--verbose", action="store_true")
@@ -149,7 +142,6 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
-        value_weight=0.0 if args.pretrain else args.value_weight,
         vae_reconstruction_weight=args.vae_reconstruction_weight,
         vae_kl_weight=args.vae_kl_weight,
         planning_horizon=args.planning_horizon,
@@ -228,31 +220,45 @@ def main() -> None:
         action_shape,
         device,
     )
+    show_progress = interactive_progress_enabled()
     progress = tqdm(
         range(start_rollout + 1, args.rollouts + 1),
         total=args.rollouts,
         initial=start_rollout,
         desc="Training Trans-WM",
         unit="rollout",
+        disable=not show_progress,
+        dynamic_ncols=show_progress,
     )
     latest_checkpoint: Path | None = None
     with ExitStack() as stack:
         stack.callback(eval_env.close)
         stack.callback(progress.close)
-        stack.enter_context(logging_redirect_tqdm())
+        if show_progress:
+            stack.enter_context(logging_redirect_tqdm())
         for rollout_index in progress:
             current_batch = replay_buffer.sample(args.sample_rollouts)
             metrics = {}
-            for _ in range(args.epochs_per_rollout):
+            for epoch_index in range(1, args.epochs_per_rollout + 1):
                 metrics = trainer.train_transitions(current_batch, args.batch_size, rng)
+                if show_progress:
+                    progress.set_postfix(
+                        rollout=f"{rollout_index}/{args.rollouts}",
+                        epoch=f"{epoch_index}/{args.epochs_per_rollout}",
+                        total=f"{metrics['total']:.4f}",
+                    )
             record = {
                 "rollout": rollout_index,
                 "sample_rollouts": args.sample_rollouts,
                 **metrics,
             }
-            progress.set_postfix(
-                total=f"{metrics['total']:.4f}",
-            )
+            if not show_progress:
+                LOGGER.info(
+                    "training rollout=%d/%d total=%.4f",
+                    rollout_index,
+                    args.rollouts,
+                    metrics["total"],
+                )
             is_best = False
             should_evaluate = (
                 rollout_index % args.checkpoint_rollouts == 0 or rollout_index == args.rollouts
@@ -298,7 +304,6 @@ def main() -> None:
                     evaluation_generator,
                     rollout_index,
                     best_online_return,
-                    0,
                 )
             if should_evaluate:
                 latest_checkpoint = _save_rolling_checkpoint(
@@ -313,7 +318,6 @@ def main() -> None:
                     evaluation_generator,
                     rollout_index,
                     best_online_return,
-                    0,
                 )
     if latest_checkpoint is not None:
         LOGGER.info("Latest checkpoint saved to %s", latest_checkpoint)

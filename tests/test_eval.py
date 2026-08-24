@@ -22,7 +22,7 @@ class OnlineEvaluationTest(unittest.TestCase):
             1, 100, 1, 1
         ).expand(2, -1, -1, -1)
 
-    def test_trans_wm_scores_particle_actions_with_terminal_ema_value(self) -> None:
+    def test_trans_wm_scores_particle_actions_with_predicted_reward(self) -> None:
         model = TransWorldModel(
             TransWorldModelConfig(
                 observation_shape=(3, 32, 32),
@@ -44,12 +44,7 @@ class OnlineEvaluationTest(unittest.TestCase):
 
         self.assertEqual(scores.shape, (2, 100))
         self.assertEqual(rewards.shape, (2, 100))
-        repeated_latent = latent[:, None].expand(-1, 100, -1).reshape(200, -1)
-        actions = self.particles[:, :, 0].reshape(200, 1)
-        terminal_value = model.ema_heads.value(
-            model.predict_next_ema(repeated_latent, actions)
-        ).reshape(2, 100)
-        torch.testing.assert_close(scores, rewards + terminal_value)
+        torch.testing.assert_close(scores, rewards)
 
     def test_trans_wm_le_selects_a_bounded_particle_action(self) -> None:
         model = LatentWorldModel(
@@ -89,12 +84,8 @@ class OnlineEvaluationTest(unittest.TestCase):
             def __call__(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
                 return action[:, :1]
 
-        class Value:
-            def __call__(self, latent: torch.Tensor) -> torch.Tensor:
-                return torch.full_like(latent[:, :1], 10.0)
-
         model = SimpleNamespace(
-            ema_heads=SimpleNamespace(reward=Reward(), value=Value()),
+            ema_heads=SimpleNamespace(reward=Reward()),
             predict_next_ema=lambda latent, action: latent,
         )
         particles = torch.tensor([[[[1.0], [2.0], [3.0]], [[-1.0], [4.0], [2.0]]]])
@@ -105,7 +96,7 @@ class OnlineEvaluationTest(unittest.TestCase):
             particles,
         )
 
-        torch.testing.assert_close(scores, torch.tensor([[16.0, 15.0]]))
+        torch.testing.assert_close(scores, torch.tensor([[6.0, 5.0]]))
         torch.testing.assert_close(first_rewards, torch.tensor([[1.0, -1.0]]))
 
 

@@ -42,7 +42,7 @@ class ParticlePolicyTest(unittest.TestCase):
     def test_default_particle_count_is_one_thousand(self) -> None:
         self.assertEqual(NUM_ACTION_PARTICLES, 1000)
         self.assertEqual(ParticlePolicy().num_particles, 1000)
-        self.assertEqual(ParticlePolicy().horizon, 8)
+        self.assertEqual(ParticlePolicy().horizon, 20)
 
     def test_update_resamples_high_score_particles_without_noise(self) -> None:
         policy = ParticlePolicy(num_particles=32, horizon=3)

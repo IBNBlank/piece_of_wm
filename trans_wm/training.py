@@ -22,10 +22,9 @@ class TrainingConfig:
     grad_clip_norm: float | None = 100.0
     observation_weight: float = 1.0
     reward_weight: float = 1.0
-    value_weight: float = 1.0
     vae_reconstruction_weight: float = 1.0
     vae_kl_weight: float = 1e-4
-    planning_horizon: int = 8
+    planning_horizon: int = 20
 
     def __post_init__(self) -> None:
         if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
@@ -39,7 +38,6 @@ class TrainingConfig:
             for weight in (
                 self.observation_weight,
                 self.reward_weight,
-                self.value_weight,
                 self.vae_reconstruction_weight,
                 self.vae_kl_weight,
             )
@@ -60,10 +58,10 @@ class TensorEpisodeBatch:
 
 @dataclass(frozen=True)
 class TensorTransitionBatch:
-    observations: torch.Tensor  # [B, 5 + P, C, H, W]
-    obs_valid: torch.Tensor  # [B, 5 + P]
-    action_history: torch.Tensor  # [B, 4, action_dim]
-    action_valid: torch.Tensor  # [B, 4]
+    observations: torch.Tensor  # [B, 3 + P, C, H, W]
+    obs_valid: torch.Tensor  # [B, 3 + P]
+    action_history: torch.Tensor  # [B, 2, action_dim]
+    action_valid: torch.Tensor  # [B, 2]
     actions: torch.Tensor  # [B, P, action_dim]
     rewards: torch.Tensor  # [B, P, 1]
     next_returns: torch.Tensor  # [B, P, 1]
@@ -120,7 +118,6 @@ class WorldModelLosses:
     total: torch.Tensor
     observation: torch.Tensor
     reward: torch.Tensor
-    value: torch.Tensor
     vae_reconstruction: torch.Tensor
     vae_kl: torch.Tensor
 
@@ -129,7 +126,6 @@ class WorldModelLosses:
             "total": self.total.detach().item(),
             "observation": self.observation.detach().item(),
             "reward": self.reward.detach().item(),
-            "value": self.value.detach().item(),
             "vae_reconstruction": self.vae_reconstruction.detach().item(),
             "vae_kl": self.vae_kl.detach().item(),
         }
@@ -327,7 +323,6 @@ def world_model_loss(
     rollout_z = latents[:, :-1]
     observation_errors = []
     reward_errors = []
-    value_errors = []
     rollout_valid = []
     rollout_steps = min(config.planning_horizon, batch.actions.shape[1])
     for offset in range(rollout_steps):
@@ -352,15 +347,6 @@ def world_model_loss(
         reward_errors.append(
             (predicted_reward - batch.rewards[:, offset:]).square().squeeze(-1)
         )
-        if config.value_weight > 0.0:
-            value_errors.append(
-                (
-                    model.heads.value(predicted_next_z.flatten(0, 1)).reshape(
-                        *predicted_next_z.shape[:2], 1
-                    )
-                    - batch.returns[:, offset + 1 :]
-                ).square().squeeze(-1)
-            )
         rollout_valid.append(step_valid)
         if offset + 1 < rollout_steps:
             rollout_z = predicted_next_z[:, :-1]
@@ -372,23 +358,17 @@ def world_model_loss(
     reward_loss = _masked_mean(
         torch.cat([item.flatten() for item in reward_errors]), valid
     )
-    value_loss = (
-        _masked_mean(torch.cat([item.flatten() for item in value_errors]), valid)
-        if value_errors
-        else reward_loss.new_zeros(())
-    )
     state_valid = batch.state_valid.flatten().to(dtype=latents.dtype)
     vae_reconstruction_loss = _masked_mean(vae_reconstruction_per_state, state_valid)
     vae_kl = _masked_mean(vae_kl_per_state, state_valid)
     total = (
         config.observation_weight * observation_loss
         + config.reward_weight * reward_loss
-        + config.value_weight * value_loss
         + config.vae_reconstruction_weight * vae_reconstruction_loss
         + config.vae_kl_weight * vae_kl
     )
     return WorldModelLosses(
-        total, observation_loss, reward_loss, value_loss, vae_reconstruction_loss, vae_kl
+        total, observation_loss, reward_loss, vae_reconstruction_loss, vae_kl
     )
 
 
@@ -410,7 +390,6 @@ def transition_world_model_loss(
     rollout_history_valid = batch.action_valid
     observation_errors = []
     reward_errors = []
-    value_errors = []
     target_vae_errors = []
     target_vae_kls = []
     for offset in range(horizon):
@@ -436,12 +415,6 @@ def transition_world_model_loss(
             .squeeze(-1)
         )
         rollout_z = model.predict_next_online(rollout_z, action)
-        if config.value_weight > 0.0:
-            value_errors.append(
-                (model.heads.value(rollout_z) - batch.next_returns[:, offset])
-                .square()
-                .squeeze(-1)
-            )
         observation_errors.append(
             (model.heads.observation_head(rollout_z) - target_observation)
             .flatten(1)
@@ -460,11 +433,6 @@ def transition_world_model_loss(
     valid = batch.transition_valid.flatten().to(dtype=rollout_z.dtype)
     observation_loss = _masked_mean(torch.stack(observation_errors, dim=1).flatten(), valid)
     reward_loss = _masked_mean(torch.stack(reward_errors, dim=1).flatten(), valid)
-    value_loss = (
-        _masked_mean(torch.stack(value_errors, dim=1).flatten(), valid)
-        if value_errors
-        else reward_loss.new_zeros(())
-    )
     current_vae_reconstruction = model.heads.observation_head(current_posterior.rsample())
     vae_reconstruction_per_state = torch.cat(
         (
@@ -494,12 +462,11 @@ def transition_world_model_loss(
     total = (
         config.observation_weight * observation_loss
         + config.reward_weight * reward_loss
-        + config.value_weight * value_loss
         + config.vae_reconstruction_weight * vae_reconstruction_loss
         + config.vae_kl_weight * vae_kl
     )
     return WorldModelLosses(
-        total, observation_loss, reward_loss, value_loss, vae_reconstruction_loss, vae_kl
+        total, observation_loss, reward_loss, vae_reconstruction_loss, vae_kl
     )
 
 

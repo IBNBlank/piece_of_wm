@@ -81,8 +81,8 @@ action = torch.gather(particles, 1, best_indices[:, None, None]).squeeze(1)
 它与 MPPI 都使用指数权重，但当前实现做离散祖先重采样，而 MPPI 做加权控制更新；
 它与 CEM 都会让搜索集中到高分区域，但当前实现没有 elite 集合，也没有拟合均值和方差。
 
-## 10-step horizon
+## 20-step horizon
 
-唯一的 `PLANNING_HORIZON` 默认为 8，并同时控制 world-model 递归训练和粒子规划。规划器累加 8 步预测 reward，并在最后添加 EMA Value；训练器对同样 8 步内的有效预测 loss 等权归一化。每轮 sigma 减少 `1/8`，最低保持为 `1/8`。
+唯一的 `PLANNING_HORIZON` 默认为 20，并同时控制 world-model 递归训练和粒子规划。规划器累加 20 步预测 reward，不使用 critic 或 terminal value；训练器对同样 20 步内的有效预测 loss 等权归一化。每轮 sigma 减少 `1/20`，最低保持为 `1/20`。
 
 默认使用 1000 个粒子和 5 次 update；两者分别由 `NUM_PARTICLES` 和 `PARTICLE_UPDATES` 配置，与 horizon 无关。Temperature 默认是 2。若 `softmax(sum_reward / temperature)` 的有效样本数明显下降，可提高 temperature；当前策略仍然没有上一轮序列左移 warm start，也不拟合 CEM 式均值和方差。

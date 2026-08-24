@@ -49,7 +49,6 @@ class TrainingCheckpointTest(unittest.TestCase):
                 grad_clip_norm=10.0,
                 jepa_weight=1.0,
                 sigreg_weight=0.2,
-                value_weight=1.0,
                 sigreg_projections=8,
                 sigreg_frequencies=4,
                 sigreg_max_frequency=5.0,
@@ -88,15 +87,17 @@ class TrainingCheckpointTest(unittest.TestCase):
                 trans_wm_le_train.main()
 
             run_pretraining.assert_called_once()
-            self.assertEqual(run_pretraining.call_args.args[4].value_weight, 0.0)
+            self.assertFalse(hasattr(run_pretraining.call_args.args[4], "value_weight"))
             make_env.assert_not_called()
 
-    def test_training_cli_has_no_gamma(self) -> None:
+    def test_training_cli_has_no_gamma_or_value_weight(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
             with self.subTest(module=module.__name__), mock.patch(
                 "sys.argv", ["train", "--data-dir", "dataset"]
             ):
-                self.assertFalse(hasattr(module.parse_args(), "gamma"))
+                args = module.parse_args()
+                self.assertFalse(hasattr(args, "gamma"))
+                self.assertFalse(hasattr(args, "value_weight"))
 
     def test_training_particle_defaults(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
@@ -107,7 +108,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertEqual(args.particle_updates, 5)
                 self.assertEqual(args.num_particles, 1000)
                 self.assertEqual(args.particle_temperature, 2.0)
-                self.assertEqual(args.planning_horizon, 8)
+                self.assertEqual(args.planning_horizon, 20)
 
     def test_rolling_checkpoints_keep_latest_two_and_resolve_latest(self) -> None:
         for module in (trans_wm_train, trans_wm_le_train):
@@ -121,7 +122,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 ):
                     for rollout in (2, 10, 1_000_000):
                         module._save_rolling_checkpoint(
-                            output_dir, *(None for _ in range(8)), rollout, 0.0, 0
+                            output_dir, *(None for _ in range(8)), rollout, 0.0
                         )
 
                 self.assertEqual(
@@ -131,14 +132,6 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertEqual(
                     module._resolve_resume_checkpoint(output_dir).name,
                     "checkpoint_1000000.pt",
-                )
-
-                legacy_dir = output_dir / "legacy"
-                legacy_dir.mkdir()
-                legacy_checkpoint = legacy_dir / "checkpoint.pt"
-                legacy_checkpoint.touch()
-                self.assertEqual(
-                    module._resolve_resume_checkpoint(legacy_dir), legacy_checkpoint
                 )
 
     def test_checkpoint_restores_training_state_and_rngs(self) -> None:
@@ -181,7 +174,6 @@ class TrainingCheckpointTest(unittest.TestCase):
                     evaluation_generator,
                     10,
                     -123.0,
-                    2,
                 )
                 expected = (
                     rng.integers(1_000_000),
@@ -209,7 +201,6 @@ class TrainingCheckpointTest(unittest.TestCase):
 
                 self.assertEqual(restored.rollout, 10)
                 self.assertEqual(restored.best_online_return, -123.0)
-                self.assertEqual(restored.checks_without_improvement, 2)
                 actual = (
                     rng.integers(1_000_000),
                     replay_buffer._rng.integers(1_000_000),
@@ -279,7 +270,6 @@ class TrainingCheckpointTest(unittest.TestCase):
                     torch.Generator().manual_seed(4),
                     10,
                     -float("inf"),
-                    0,
                     phase="pretrain",
                     best_validation_loss=0.25,
                 )
@@ -289,10 +279,6 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertEqual(checkpoint["epoch"], 10)
                 self.assertNotIn("rollout", checkpoint)
                 self.assertEqual(checkpoint["best_validation_loss"], 0.25)
-                self.assertEqual(
-                    checkpoint["validation_metric_version"],
-                    training_runtime.VALIDATION_METRIC_VERSION,
-                )
                 module._load_pretrained_checkpoint(
                     path,
                     model,
@@ -317,6 +303,16 @@ class TrainingCheckpointTest(unittest.TestCase):
                     output_dir=output_dir,
                 )
                 with (
+                    mock.patch.object(
+                        training_runtime,
+                        "interactive_progress_enabled",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        training_runtime,
+                        "tqdm",
+                        wraps=training_runtime.tqdm,
+                    ) as tqdm_mock,
                     mock.patch.object(
                         training_runtime,
                         "evaluate_validation",
@@ -345,6 +341,8 @@ class TrainingCheckpointTest(unittest.TestCase):
                     )
 
                 self.assertEqual(trainer.train_epoch.call_count, args.epochs)
+                self.assertEqual(tqdm_mock.call_count, 1)
+                self.assertTrue(tqdm_mock.call_args.kwargs["disable"])
                 trainer.train_epoch.assert_called_with(
                     replay_buffer.batches,
                     args.batch_size,
@@ -365,7 +363,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 source_config.observation_shape,
                 source_config.action_shape,
             )
-            pretraining_config = trans_wm_le_train.TrainingConfig(value_weight=0.0)
+            pretraining_config = trans_wm_le_train.TrainingConfig()
             source_model = trans_wm_le_train.WorldModel(source_config)
             source_trainer = trans_wm_le_train.WorldModelTrainer(
                 source_model, pretraining_config
@@ -384,7 +382,6 @@ class TrainingCheckpointTest(unittest.TestCase):
                 torch.Generator().manual_seed(4),
                 1,
                 -float("inf"),
-                0,
                 phase="pretrain",
             )
 
