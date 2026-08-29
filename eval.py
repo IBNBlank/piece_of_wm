@@ -242,20 +242,16 @@ def run_online_episode(
 
     for timestep in range(max_steps):
         observation_history, observation_valid = _observation_history(images, model)
-        action_history, action_valid = _action_history(actions, model)
         with torch.inference_mode():
-            latent = model.encode_ema(
-                observation_history, observation_valid, action_history, action_valid
-            )
-            action, predicted_reward = select_particle_action(
-                model,
-                latent,
-                policy,
-                particle_updates,
-                particle_sigma,
-                particle_temperature,
-                generator,
-            )
+            observation = model.encoder(observation_history, observation_valid)
+            previous_action = torch.zeros((1, model.config.action_dim), device=observation.device, dtype=observation.dtype)
+            if actions:
+                previous_action = torch.as_tensor(actions[-1], device=observation.device, dtype=observation.dtype).reshape(1, -1)
+            if timestep == 0:
+                rssm_state = model.rssm_initial(1)
+            rssm_state, _, _ = model.rssm.observe_step(rssm_state, previous_action, observation)
+            action = model.actor(rssm_state.features, deterministic=True)
+            predicted_reward = model.heads.reward(rssm_state.z, action).squeeze(-1)
         action_array = action.detach().cpu().numpy().reshape(model.config.action_shape)
         _, reward, terminated, truncated, _ = env.step(action_array)
         actions.append(action_array.astype(np.float32, copy=False))
@@ -328,12 +324,15 @@ def score_particles(
     model: Any,
     latent: torch.Tensor,
     particles: torch.Tensor,
+    discount: float = 0.99,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if particles.ndim != 4:
         raise ValueError("particles must have shape [batch, particles, horizon, action_dim].")
     batch_size, num_particles, horizon, action_dim = particles.shape
     if horizon == 0:
         raise ValueError("particle sequence horizon must be positive.")
+    if not 0.0 <= discount <= 1.0:
+        raise ValueError("discount must be in [0, 1].")
     repeated_latent = latent[:, None].expand(-1, num_particles, -1).reshape(
         batch_size * num_particles, -1
     )
@@ -348,8 +347,13 @@ def score_particles(
         )
         if first_rewards is None:
             first_rewards = rewards
-        scores = scores + rewards
+        scores = scores + discount**timestep * rewards
         repeated_latent = model.predict_next_ema(repeated_latent, flat_actions)
+    # TD-MPC-like exposes a state-value head for the terminal latent. Keep the
+    # generic planner compatible with world models that only predict rewards.
+    value = getattr(model.ema_heads, "value", None)
+    if value is not None:
+        scores = scores + discount**horizon * value(repeated_latent, flat_actions).reshape(batch_size, num_particles)
     return scores, first_rewards
 
 

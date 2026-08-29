@@ -23,6 +23,16 @@ def make_env(env_id: str, *, render_mode: str | None = None) -> gym.Env:
             raise ImportError(
                 "Robotics environments require gymnasium-robotics[mujoco]; run ./venv.sh."
             ) from error
+        version = getattr(gymnasium_robotics, "__version__", "0.0.0")
+        import mujoco
+
+        robotics_version = tuple(int(part) for part in version.split(".")[:3])
+        mujoco_version = tuple(int(part) for part in mujoco.__version__.split(".")[:3])
+        if robotics_version < (1, 4, 3) and mujoco_version >= (3, 3, 0):
+            raise RuntimeError(
+                f"FetchPickAndPlace-v4 with gymnasium-robotics {version} requires "
+                f"mujoco<3.3 (found {mujoco.__version__}); run ./venv.sh to update the environment."
+            )
     env = gym.make(env_id, render_mode=render_mode)
     if not isinstance(env.action_space, gym.spaces.Box):
         env.close()

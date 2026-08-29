@@ -91,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
     parser.add_argument("--jepa-weight", type=float, default=1.0)
     parser.add_argument("--sigreg-weight", type=float, default=0.2)
+    parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--sigreg-projections", type=int, default=256)
     parser.add_argument("--sigreg-frequencies", type=int, default=17)
     parser.add_argument("--sigreg-max-frequency", type=float, default=5.0)
@@ -144,6 +146,8 @@ def main() -> None:
         grad_clip_norm=args.grad_clip_norm,
         jepa_weight=args.jepa_weight,
         sigreg_weight=args.sigreg_weight,
+        value_weight=args.value_weight,
+        discount=args.discount,
         sigreg_projections=args.sigreg_projections,
         sigreg_frequencies=args.sigreg_frequencies,
         sigreg_max_frequency=args.sigreg_max_frequency,

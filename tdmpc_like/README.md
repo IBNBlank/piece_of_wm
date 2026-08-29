@@ -1,6 +1,8 @@
-# TD-MPC-like：图像历史 JEPA Transformer 世界模型
+# TD-MPC-like：基于 JEPA 表征学习的 latent MPC 世界模型
 
-`tdmpc_like` 实现一个与 policy 完全解耦的 action-conditioned latent JEPA world model。模型不包含图像 decoder、VAE、生成式 dynamics、RSSM prior/posterior、actor、CEM 或 MPC。
+`tdmpc_like` 是一个 TD-MPC 风格的 latent model-predictive-control 系统：在 latent space 中递归预测 dynamics，用 reward head 和 clipped double-Q head 评估候选 action sequence，再通过 particle-based MPC 选择动作。JEPA 负责学习稳定的 observation/action-conditioned latent 和 latent dynamics target；它是 TD-MPC-like 的表征学习部分，而不是整个算法本身。
+
+当前实现没有图像 decoder、VAE、RSSM prior/posterior 或独立 actor。它使用离线 rollout replay 训练 world model，并在评估时使用 EMA world model 做 latent planning。
 
 训练循环的完整执行顺序、数据对齐和参数更新范围见 [TRAINING_LOGIC.md](TRAINING_LOGIC.md)。
 
@@ -9,7 +11,7 @@
 - 最近 3 帧图像经过 CNN 得到 `obs tensor`；
 - `obs tensor` 与最近 2 个已执行 action 组成的 `ah tensor` 经过小型 MLP，得到固定 128 维 `latent state`。
 
-外部 policy 给出当前 action 后，Transformer Dynamics 根据当前 latent 和 action 预测下一个 latent。训练时，预测 latent 通过 JEPA loss 对齐由下一真实 observation 和更新后 action history 编码得到的 EMA target latent，并使用 SIGReg 防止表示坍塌。
+给定当前 latent 和 action，Transformer Dynamics 预测下一个 latent；Reward head 预测即时奖励，两个 Q head 预测 action-conditioned value。规划时对候选动作序列做 latent rollout，累加 discounted reward，并用末端 EMA Q 做 bootstrap。训练同时包含 TD-MPC 风格的 reward/Q 目标，以及 JEPA latent consistency 和 SIGReg 表征正则。
 
 ## 运行框架
 
@@ -56,9 +58,12 @@ flowchart LR
 
     subgraph Heads[直接读取 latent 的预测头]
         RH["Reward Head<br/>r_hat(t)"]
-        SCORE["multi-step score<br/>reward sum"]
-        ZP --> RH
+        VH["Twin Q Heads<br/>Q1/Q2(z,a)"]
+        SCORE["multi-step score<br/>discounted reward + terminal Q"]
+        Z --> RH
         RH --> SCORE
+        Z --> VH
+        VH --> SCORE
     end
 
     subgraph JEPATarget[JEPA Target Branch]
@@ -174,7 +179,7 @@ Dynamics 不再读取 `ah_t`。历史 action 已经在 Latent Encoder 中进入 
 
 ## Heads 与 Action Score
 
-模型不包含 Observation Head、图像 decoder 或 critic。Reward Head 读取 128 维 latent 和当前 action。
+模型不包含 Observation Head 或图像 decoder。Reward Head 读取 128 维 latent 和当前 action；两个 Q head 读取相同的 `(z, a)`，并以较小者作为 clipped double-Q value。
 
 ### Reward Head
 
@@ -195,16 +200,19 @@ r_hat_t: [B, 1]
 
 ### Action Score
 
-外部 policy 对候选 action sequence 递归预测 latent，并累加 Reward Head 的输出：
+外部 policy 对候选 action sequence 递归预测 latent，累加 discounted Reward Head 输出，并在最后加入 terminal latent/action 的 clipped double-Q 输出：
 
 ```text
 z_hat_{t+1} = Dynamics(z_t, a_t)
 
 score(a_t:t+H-1)
-    = sum_k RewardHead(z_t+k, a_t+k)
+    = sum_k gamma^k RewardHead(z_t+k, a_t+k)
+      + gamma^H min(Q1_EMA, Q2_EMA)(z_t+H, a_t+H)
 ```
 
-规划器不使用 critic 或 terminal value，reward sum 也不折扣。
+规划器使用 EMA world model 进行多步评分：对 reward 做 discount，并在最后使用 EMA twin-Q 的较小值进行 bootstrap。`rollout` 同时返回每一步的 reward、clipped-Q value 和 score。
+
+其中 `score_particles` 返回候选序列的累计规划分数；`RolloutOutput.scores` 保留每一步的即时 reward score，便于与 rollout 时间轴对齐，并不表示累计序列分数。
 
 ## Padding 与 Mask
 
@@ -339,6 +347,15 @@ L_reward(t) = (RewardHead(z_t, a_t) - r_t)^2
 
 第一步 Reward loss 更新 Encoder 和 Reward Head；后续步读取递归预测 latent，因此也会向 Dynamics 反传。Dynamics 同时由所有预测步的 JEPA loss 更新。
 
+### Value Loss
+
+两个 Q head 预测 action-conditioned Q，采用 TD-MPC 风格的 clipped double-Q discounted target：
+
+```text
+Q_target(t) = r_t + gamma(1-d_t) min(Q1_target, Q2_target)(z_{t+1}, a_{t+1})
+L_value(t) = mean_i (Qi(z_t, a_t) - Q_target(t))^2
+```
+
 ### 总损失
 
 所有 horizon 内有效预测步等权，并按有效预测总数做 masked mean，因此增大 horizon 不会直接线性放大 loss。episode 尾部越界位置不参与更新。随后各项 loss 按配置权重相加：
@@ -348,9 +365,10 @@ L_total =
     jepa_weight   * L_JEPA
     + sigreg_weight * L_SIGReg
     + reward_weight * L_reward
+    + value_weight * L_value
 ```
 
-`jepa_weight` 和 `reward_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss、VAE KL loss 或 critic loss。
+`jepa_weight`、`reward_weight` 和 `value_weight` 默认是 `1.0`，`sigreg_weight` 默认是 `0.2`。模型没有 observation reconstruction loss、VAE reconstruction loss 或 VAE KL loss。
 
 ## EMA Target 与 Policy API
 
@@ -365,7 +383,8 @@ theta_target = ema * theta_target + (1 - ema) * theta_online
 - Observation Encoder；
 - Latent Encoder；
 - Latent Dynamics；
-- Reward Head。
+- Reward Head；
+- Twin Q Heads (`Q1`, `Q2`)。
 
 默认公共 API `encode`、`predict_next`、`predict_heads`、`evaluate_action` 和 `rollout` 使用冻结的 EMA 模块并禁用梯度。训练器显式调用对应的在线 API。
 
@@ -379,8 +398,10 @@ z_t = model.encode(
 
 z_next = model.predict_next(z_t, action)
 heads = model.predict_heads(z_next, action)
+# heads.reward: [B, 1], heads.value: [B, 1]
 evaluation = model.evaluate_action(z_t, action)
 rollout = model.rollout(z_t, action_history, external_actions, action_valid_mask)
+# rollout.values / rollout.scores: [B, horizon, 1]
 ```
 
 注意：`rollout` 接收并更新 action history，是为了返回与 rollout 结束位置对齐的 history。每一步 Dynamics 本身只读取 `z` 和当前 action，不读取 action history。
@@ -448,7 +469,24 @@ rollout = model.rollout(
 )
 ```
 
-## 命令行训练
+## 与原始 TD-MPC 的关系
+
+当前实现是一个带 TD-MPC 风格 latent rollout 的 JEPA world model，不是原始 TD-MPC 的完整复现：
+
+| 组件 | 当前 `tdmpc_like` | 原始 TD-MPC（TD-MPC/TD-MPC2 风格） |
+| --- | --- | --- |
+| 观测编码 | 最近 3 帧图像 + 最近 2 个 action history，CNN + MLP | 通常对当前观测编码为 latent；不依赖本实现的固定历史窗口 |
+| latent dynamics | 确定性的 2-token Transformer，`z' = f(z, a)` | 确定性 latent dynamics，通常为 MLP/残差模型 |
+| reward | 单个 `RewardHead(z, a)` | reward model，通常与 dynamics 一起训练 |
+| value / critic | 双 action-conditioned Q head，使用 EMA clipped double-Q target | 双 Q critic `Q(z, a)`，用 TD bootstrapping 和 target critics 更新 |
+| 表征目标 | EMA encoder 产生 JEPA target latent，另有 SIGReg | 常见是 latent consistency / reconstruction 类目标，不是本项目的 EMA-JEPA 方案 |
+| planning | discounted particle action search；`discounted reward + terminal Q` | MPC，常用 CEM/sequence optimization，并使用 Q terminal value |
+| policy | 没有单独 actor，在线规划直接选动作 | 通常同时学习 actor，并在规划与数据收集时使用 |
+| 折扣与 TD 更新 | `discount=0.99`，使用 `r + gamma(1-d)min(Q1_target,Q2_target)` | 折扣 Bellman target，`r + gamma * Q_target` |
+| target network | encoder、dynamics、heads 全部 EMA | 主要是 target critics / target value networks |
+| 数据训练方式 | 离线 rollout replay，按连续 horizon 训练 | 通常在线 replay、环境交互和策略更新交替进行 |
+
+共同点是：都在 latent space 中递归预测 action sequence，用 reward model 和 terminal Q 评价候选序列，并使用慢更新的 target 参数进行 Bellman bootstrap。JEPA 在这里承担的是表征学习和 latent consistency：它为 TD-MPC 的 `z` 与 dynamics 提供稳定目标；TD-MPC 的 reward、双 Q、discount 和 MPC planning 则把这些 latent 转化为控制信号。关键差异是当前实现没有 actor 更新、没有标准 CEM，数据主要来自离线 rollout replay，且 observation/action history 与 Transformer dynamics 是本项目的特有设计。
 
 推荐使用仓库根目录下的运行脚本。网络结构使用 `WorldModelConfig` 中的固定配置：observation dim 128、Transformer model dim 256、3 层、4 个 attention heads、FFN dim 512、CNN channels `(32, 64, 128)`、dropout 0。训练参数可以通过环境变量覆盖：
 

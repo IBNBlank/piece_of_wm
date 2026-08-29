@@ -1,76 +1,31 @@
-# Dreamer-like：图像历史 Transformer 世界模型
+# Dreamer-like：多帧观测 Dreamer v1 世界模型
 
-`dreamer_like` 实现一个与 policy 完全解耦的图像 Transformer world model。当前结构不维护 latent history，也不包含生成式 dynamics、RSSM、actor、CEM 或 MPC。VAE posterior 由图像 observation representation 和前序 action history 共同生成。
+`dreamer_like` 实现 Dreamer v1 风格的图像世界模型。模型使用 RSSM（确定性 recurrent state + stochastic state）、actor、value、continuation 和 latent imagination；observation 使用连续 3 帧图像历史。
 
-模型只维护两个状态：
-
-- 当前图像历史和前序 action history 共同编码得到的 `z tensor`；
-- 最近 2 个已执行 action 组成的 action history。
-
-外部 policy 给出当前 action 后，Dynamics 直接预测确定性的下一个 `z tensor`。Heads 从 latent 预测 observation，并从当前 latent 与 action 预测 reward。
+训练循环的完整执行顺序、数据对齐和参数更新范围见 [TRAINING_LOGIC.md](TRAINING_LOGIC.md)。
 
 ## 运行框架
 
 ```mermaid
 flowchart LR
-    subgraph Encoder[图像历史编码器]
-        IM["最近 3 张图像<br/>B x 3 x C x H x W"]
-        MASK["obs_valid_mask<br/>B x 3"]
-        STACK["屏蔽 padding<br/>沿 channel 拼接<br/>B x (3*C) x H x W"]
-        CNN["多层 CNN 下采样"]
-        OBS["observation tensor<br/>B x observation_dim"]
-        IM --> STACK
-        MASK -.-> STACK
-        STACK --> CNN --> OBS
-    end
-
-    subgraph ActionHistory[Action History]
-        A9["最近 2 个 action<br/>B x 2 x A"]
-        AM["action_valid_mask<br/>B x 2"]
-        AH["屏蔽 padding 后拉直<br/>ah tensor: B x (2*A)"]
-        A9 --> AH
-        AM -.-> AH
-    end
-
-    subgraph LatentEncoder[Variational Latent Encoder]
-        CAT["concat observation 与 ah"]
-        STAT["MLP<br/>posterior mean / log_variance"]
-        SAMPLE["reparameterized sample"]
-        Z["当前 z = posterior mean<br/>B x 128"]
-        OBS --> CAT
-        AH --> CAT
-        CAT --> STAT
-        STAT --> Z
-        STAT --> SAMPLE
-    end
-
-    subgraph Dynamics[确定性 Latent Dynamics]
-        ZT["z token"]
-        AT["当前 action token"]
-        TR["普通 Transformer Encoder<br/>固定 2 个 token"]
-        ZN["预测 z_hat(t+1)<br/>B x 128"]
-        Z --> ZT --> TR
-        A["外部 policy 给出的 a(t)"] --> AT --> TR
-        TR -->|读取 z token 对位输出| ZN
-    end
-
-    subgraph Heads[直接读取 z 的预测头]
-        DEC["CNN Decoder"]
-        OH["重建的 3 张图像<br/>B x 3 x C x H x W"]
-        RH["Reward Head<br/>r_hat"]
-        SCORE["multi-step score<br/>reward sum"]
-        ZN --> DEC --> OH
-        SAMPLE -. 同窗口 VAE 重建 .-> DEC
-        ZN --> RH
-        RH --> SCORE
-    end
-
-    ZN -->|直接替换当前 z| NEXT["下一 rollout step"]
-    A -->|追加并保留最近 2 个| A9N["新的 action history"]
-    A9N --> NEXT
-
-    ONLINE["online Encoder + Dynamics + Heads"] -->|EMA update| EMA["frozen EMA Encoder + Dynamics + Heads"]
-    EMA -->|no_grad policy API| POLICY["external policy"]
+    O["图像历史 o_t"] --> E["三帧 CNN Encoder"]
+    E --> OBS["observation embedding"]
+    PS["上一 RSSM state (h_{t-1}, z_{t-1})"] --> R["GRU transition<br/>只接收 state 与 a_{t-1}"]
+    A["上一动作 a_{t-1}"] --> R
+    R --> H["确定性状态 h_t"]
+    H --> P["posterior q(z_t|h_t,o_t)"]
+    OBS --> P
+    H --> Q["prior p(z_t|h_t)"]
+    P --> Z["随机状态 z_t"]
+    Q --> K["KL q||p"]
+    H --> F["feature_t = concat(h_t, z_t)"]
+    Z --> F
+    F --> I["latent imagination"]
+    I --> AC["Actor / Value"]
+    I --> RH["Reward / Continuation heads"]
+    RH --> LR["TD(lambda) return"]
+    AC --> LR
+    LR --> AC
 ```
 
 ## Observation Encoder
@@ -82,244 +37,177 @@ obs_history:    [B, 3, C, H, W]
 obs_valid_mask: [B, 3]
 ```
 
-3 张图像首先沿 channel 维拼接：
+padding 位置先由 `obs_valid_mask` 清零，然后沿 channel 维拼接：
 
 ```text
 [B, 3, C, H, W] -> [B, 3*C, H, W]
 ```
 
-拼接结果经过多层 stride-2 CNN 压缩，再拉直并通过 Linear 得到 128 维 observation representation。它还不是 `z_t`。
-
-## Variational Latent Encoder
-
-当前 observation representation 与前序 action history 拉直后的 `ah_t` 拼接，经 MLP 输出 128 维 posterior mean 和 log-variance。在线任务使用 posterior mean 作为确定性的 `z_t`：
+拼接结果经过多层 stride-2 CNN 和 `Flatten + Linear` 得到 observation embedding：
 
 ```text
-z_t: [B, 128]
+observation_t: [B, observation_dim]
 ```
 
-模型只输出当前一个 `z_t`。episode 开头不足 3 帧的位置使用零 padding，且在拼接前用 `obs_valid_mask` 清零，不重复第一帧。
+episode 开头不足 3 帧的位置使用零值左 padding，不重复第一帧。
 
-训练时还会从同一个 posterior 重参数采样，并要求 CNN Decoder 重建产生该 posterior 的同一个 3-frame window。
+## RSSM Posterior 与 Prior
 
-## Action History
-
-最近 2 个 action 只用于构造一个整体的 `ah tensor`：
+RSSM 状态由确定性循环状态和随机状态组成：
 
 ```text
-action_history: [B, 2, action_dim]
-ah tensor:      [B, 2 * action_dim]
+s_t = (h_t, z_t)
 ```
 
-padding action 会先由 `action_valid_mask` 清零再拉直。`encode` 同时支持传入原始 `[B,2,A]` history，或者直接传入已经拼好的 `[B,2*A]` `ah tensor`。
-
-模型不维护 latent history，也没有 append latent history 的过程。rollout 时只执行：
+对每个时间步按顺序执行：
 
 ```text
-z <- z_hat_next
-action_history <- append(action_history, executed_action)[-2:]
+h_t = GRU(h_{t-1}, [z_{t-1}, a_{t-1}])
+p(z_t | h_t)       = prior(h_t)
+q(z_t | h_t, o_t)   = posterior(h_t, observation_t)
+z_t ~ q(z_t | h_t, o_t)
 ```
 
-## Latent Dynamics
+真实数据使用 posterior state，KL 项约束 posterior 接近 prior。观测 `o_t` 只进入 posterior，不进入 deterministic transition。想象阶段不读取真实下一帧，只使用 prior 采样下一随机状态。
 
-Dynamics 是普通的确定性 Transformer Encoder。输入序列始终只有两个 token，并保持以下顺序：
+## Latent Imagination
+
+RSSM feature 仅表示确定性状态和随机状态的拼接：
 
 ```text
-1. z_t token
-2. current action a_t token
+feature_t = concat(h_t, z_t)
+feature_t: [B, rssm_hidden_dim + rssm_stochastic_dim]
 ```
 
-两个输入 tensor 分别经过独立 Linear projection 映射到 `model_dim`，加上位置 embedding 后进入 Transformer。最终只读取 `z_t` token 对应位置的输出，并映射成：
+它不是额外维护的状态，也不是 observation embedding；actor、value、reward
+和 continuation head 使用这个拼接结果作为输入。
+
+从最后一个 posterior state 开始，actor 在 latent space 中生成 action：
 
 ```text
-z_hat_{t+1}: [B, 128]
+s_0 = posterior_state[-1]
+
+for k in range(H):
+    a_k ~ Actor(h_k, z_k)
+    s_{k+1} ~ p(s_{k+1} | s_k, a_k)
+    r_k = RewardHead(s_{k+1}, a_k)
+    c_k = ContinuationHead(s_{k+1})
+    v_k = Value(s_{k+1})
 ```
 
-这里没有均值、方差、noise、sampling 或 generative rollout。相同输入始终产生相同 `z_hat_{t+1}`。
+Actor 输出经过 `tanh`，对应环境的 `[-1, 1]` action 范围。`continuation` 是 episode 尚未结束的概率，用作 imagined return 的 discount gate。
 
 ## Heads 与 Action Score
 
-Observation Head 和 Reward Head 都直接读取单个当前 `z tensor`，不读取 latent history。
-
 ### Observation Head
 
-Observation Head 将 `z_t` 映射回 CNN feature map，再通过转置卷积重建 Encoder 对应的整组 3 张图像：
+Observation decoder 将随机 latent 映射回对应的 3-frame window：
 
 ```text
 z_t -> observation_hat_history_t
-
 observation_hat_history_t: [B, 3, C, H, W]
 ```
 
 ### Reward Head
 
-Reward Head 输出该状态对应的当前 transition reward：
+Reward Head 使用 RSSM feature 和当前 action 预测 transition reward：
 
 ```text
-reward_hat: [B, 1]
+r_hat_t = RewardHead(concat(h_t, z_t), a_t)
+r_hat_t: [B, 1]
 ```
 
-对于 replay 数据中的 transition：
+对于 replay transition，时间语义为：
 
 ```text
-z_t --a_t--> z_{t+1}, reward r_t
+s_t --a_t--> s_{t+1}, r_t
 ```
 
-训练和 rollout 都直接使用 `(z_t, a_t)` 预测 `r_t`：
+### Value 与 TD(lambda)
+
+Dreamer v1 使用 continuation 和 value bootstrap 计算 TD(lambda) 目标：
 
 ```text
-r_hat_t = RewardHead(z_t, a_t)
+G_k = r_k + gamma * c_k * ((1 - lambda) * V_{k+1} + lambda * G_{k+1})
 ```
 
-这与 Pendulum 在状态积分前由当前状态和 action 计算 reward 的时间语义一致。
-
-### Action Score
-
-外部 policy 的 action 先经过 Dynamics 得到下一个状态，再通过 Heads 计算分数：
-
-```text
-z_hat_{t+1} = Dynamics(z_t, a_t)
-
-score(a_t:t+H-1)
-    = sum_k reward_hat(z_t+k, a_t+k)
-```
-
-规划器使用 EMA dynamics rollout 候选动作序列并累加多步预测 reward，不使用 critic 或 terminal value，也不做折扣。
+actor 最大化 `G_k`，value 回归到 `stop_gradient(G_k)`。这里没有 particle planner 或 terminal Q bootstrap。
 
 ## Padding 与 Mask
 
-图像历史和 action history 都使用零值左 padding：
+图像历史使用零值左 padding：
 
 ```text
 images:     [PAD o0 o1]
 image mask: [ 0  1  1]
-
-actions:    [PAD a0]
-action mask:[ 0  1]
 ```
 
-训练时还使用 `transition_valid` 排除 batch 中 episode 结束后的无效 transition。
+mask 在进入 CNN 前显式清零 padding 值。训练 batch 的 transition 由 rollout 的有效长度决定，episode 尾部的无效时间步不会参与损失。
 
 ## 训练时间对齐
 
-`EpisodeBatch` 中的图像数据布局为 `[B,T+1,H,W,C]`。训练器会自动转换为 `[B,T+1,C,H,W]`，整数图像还会按 dtype 最大值归一化到 `[0,1]`。
+`EpisodeBatch` 中的图像数据布局为 `[B,T+1,H,W,C]`。训练入口会转换为 channel-first，并将整数图像按 dtype 最大值归一化到 `[0,1]`。
 
-每个 transition 的对齐关系是：
+每个 transition 的对齐关系为：
 
 ```text
-3-frame history ending at o_t     + a_{t-2:t-1} -> z_t
-3-frame history ending at o_{t+1} + a_{t-1:t}   -> z_{t+1}
-
-Dynamics(z_t, a_t)        -> z_hat_{t+1}
-ObservationHead(z_t)      -> 3-frame history ending at o_t
-RewardHead(z_t, a_t)      -> r_t
+3-frame history ending at o_t       -> observation_t -> posterior state s_t
+s_t + a_t                           -> RSSM prior state s_{t+1}
+RewardHead(s_t, a_t)                -> r_t
 ```
+
+实现中 `frames[:, t]` 与 `actions[:, t]`、`rewards[:, t]` 保持同一 transition 时间轴；开头的历史 padding 只通过 mask 标记，不重复真实帧。
 
 ## 损失函数
 
-### 图像重建损失
-
-Dynamics 产生的 `z_hat_{t+1}` 通过 Observation Head 重建下一时刻的完整 3-frame history：
+### RSSM KL 损失
 
 ```text
-L_obs(t) = mean((observation_hat_history(z_hat_{t+1}) - observation_history_{t+1})^2)
+L_KL(t) = KL(q(z_t | h_t, o_t) || p(z_t | h_t))
+```
+
+### 图像重建损失
+
+posterior state 的随机 latent 经过 decoder 重建对应图像历史：
+
+```text
+L_obs(t) = mean((Decoder(z_t) - observation_history_t)^2)
 ```
 
 ### Reward 损失
 
 ```text
-L_reward(t) = (reward_hat(z_t, a_t) - r_t)^2
+L_reward(t) = (RewardHead(s_t, a_t) - r_t)^2
 ```
 
-### 同窗口 VAE 辅助任务
+### Behavior 损失
 
-Variational Latent Encoder 对每一个真实 state 的图像窗口与对齐 action history 输出 VAE posterior：
+从 posterior state 进行 prior imagination 后，计算 actor 和 value 损失：
 
 ```text
-q(z_t | observation_t, ah_t) = Normal(mean_t, exp(0.5 * log_variance_t))
-z_sample = mean + exp(0.5 * log_variance) * epsilon
+L_actor = -mean(G_k)
+L_value = mean((V(s_k) - stop_gradient(G_k))^2)
 ```
 
-沿完整有效 horizon，每一步的 `z_sample` 都交给 CNN Decoder 重建该步对应窗口；Dynamics 预测的 `z_hat` 则逐步解码下一窗口：
-
-```text
-L_vae_recon = mean((Decoder(z_sample) - window)^2)
-L_vae_kl = -0.5 * mean(1 + log_variance - mean^2 - exp(log_variance))
-```
-
-多步 VAE 持续更新 Observation Encoder、Variational Latent Encoder 和 Decoder。Dynamics 不使用 `z_hat` 与 encoder latent 之间的 NLL、MSE 或直接 latent matching；它通过逐步恢复未来 observation window 获得训练信号。
-
-EMA 参数在每次训练更新后更新，覆盖 Observation Encoder、Variational Latent Encoder、Dynamics 和全部 Heads：
-
-```text
-theta_target = ema * theta_target + (1 - ema) * theta_online
-```
-
-默认 `ema = 0.99`。
-
-### 总损失
-
-训练从每个采样起点按唯一的 `PLANNING_HORIZON` 递归展开 Dynamics，默认 20 步。第 `k+1` 步使用第 `k` 步预测 latent，而不是重新编码真实状态作为 Dynamics 输入。所有有效预测步等权并按有效预测总数归一化；episode 尾部不足 horizon 的部分由 mask 排除。
-
-所有 loss 先在有效 rollout step/window 上做 masked mean，再按配置权重相加：
-
-```text
-L_total =
-    observation_weight * L_obs
-    + reward_weight * L_reward
-    + vae_reconstruction_weight * L_vae_recon
-    + vae_kl_weight * L_vae_kl
-```
-
-默认 `vae_reconstruction_weight = 1.0`，`vae_kl_weight = 1e-4`。
-
-## Policy 使用 EMA 模型
-
-默认公共 API `encode`、`predict_next`、`predict_heads`、`evaluate_action` 和 `rollout` 已直接绑定 EMA 模型，并全部禁用梯度。显式 `_ema` API 与它们等价：
-
-```python
-z_t = model.encode(obs_history, obs_valid_mask, action_history, action_valid_mask)
-z_next = model.predict_next(z_t, action)
-heads = model.predict_heads(z_next, action)
-evaluation = model.evaluate_action(z_t, action)
-rollout = model.rollout(z_t, action_history, external_actions)
-```
-
-这些 API 使用冻结的 `ema_encoder`、`ema_dynamics` 和 `ema_heads`，不会把 policy 的推理计算图连接到在线训练参数。只有训练器会显式调用 `encode_online`、`predict_next_online` 和 `predict_heads_online`。
+一次优化步骤将 world-model、actor 和 value loss 合并，并使用一个 Adam 优化器更新全部在线参数。
 
 ## API 示例
 
 ```python
-from dreamer_like import WorldModel, WorldModelConfig, WorldModelTrainer
+from dreamer_like import DreamerV1, WorldModelConfig
 
-model = WorldModel(
+model = DreamerV1(
     WorldModelConfig(
         observation_shape=(3, 128, 128),  # C, H, W
         action_shape=(1,),
-        latent_dim=128,
     )
 )
 
-# 训练。
-trainer = WorldModelTrainer(model)
-metrics = trainer.train_batch(replay_buffer.sample())
-
-# 默认 API 已使用 EMA observation encoder 和 latent encoder。
-z_t = model.encode(obs_history, obs_valid_mask, action_history, action_valid_mask)
-z_next = model.predict_next(z_t, action)
-
-# 直接从 z 预测 3 张图像，并从 (z, action) 预测 reward。
-heads = model.predict_heads(z_t, action)
-
-# 预测 action-conditioned next state 和当前 transition reward。
-evaluation = model.evaluate_action(z_t, action)
-one_step_score = evaluation.score
-
-# 对外部 action sequence rollout，只维护 action history。
-rollout = model.rollout(
-    z_t,
-    action_history,
-    external_actions,  # [B, horizon, *action_shape]
-    action_valid_mask,
+losses = model.loss(
+    frame_history,  # [B, T, 3, C, H, W]
+    frame_mask,     # [B, T, 3]
+    actions,        # [B, T, action_dim]
+    rewards,        # [B, T, 1]
 )
+losses.total.backward()
 ```

@@ -25,6 +25,9 @@ source .venv/bin/activate
 
 # Install dependencies
 uv pip install --upgrade torch --index-url https://mirrors.aliyun.com/pypi/simple/
-uv pip install numpy Pillow tqdm "gymnasium[classic-control]==1.3.0" "gymnasium-robotics[mujoco]"
+# gymnasium-robotics 1.4.2 compares joint enums in a way that is incompatible
+# with MuJoCo 3.3+. Keep the tested MuJoCo 3.2 API until Robotics publishes a
+# compatible release.
+uv pip install numpy Pillow tqdm "gymnasium-robotics==1.4.2" "mujoco<3.3"
 
 cd $CUR_DIR

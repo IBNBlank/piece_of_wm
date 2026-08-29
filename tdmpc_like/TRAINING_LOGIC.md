@@ -21,7 +21,7 @@ flowchart TD
         JEPA --> TOTAL["L = w_jepa L_jepa + w_sigreg L_sigreg +<br/>w_reward L_reward"]
         SIGREG --> TOTAL
         REWARD --> TOTAL
-        TOTAL --> WORLD_OPT["AdamW: encoder, latent encoder,<br/>dynamics, reward head"]
+        TOTAL --> WORLD_OPT["AdamW: encoder, latent encoder,<br/>dynamics, reward head, value head"]
     end
 
     WORLD_OPT --> EMA1["EMA update of all target modules"]
@@ -87,16 +87,19 @@ sequenceDiagram
 
 ## Replay World-Model Update
 
-`train_transitions` 更新在线 encoder、latent encoder、Transformer dynamics 和 reward head。完整损失是：
+`train_transitions` 更新在线 encoder、latent encoder、Transformer dynamics、reward head 和 value head。完整损失是：
 
 ```text
 L_JEPA   = mean((z_hat_{t+1} - stopgrad(z_target_{t+1}))^2)
 L_reward = mean((RewardHead(z_t, a_t) - r_t)^2)
+Q_target = r_t + gamma(1-d_t) min(Q1_target, Q2_target)(z_{t+1}, a_{t+1})
+L_value  = mean_i((Qi(z_t, a_t) - Q_target)^2)
 L_SIGReg = Gaussian-distribution regularization on online z_t and z_{t+1}
 
 L_world = jepa_weight * L_JEPA
         + sigreg_weight * L_SIGReg
         + reward_weight * L_reward
+        + value_weight * L_value
 ```
 
 `z_target_{t+1}` 仅由 EMA observation encoder 和 EMA latent encoder 得到，因此 JEPA 的 target 分支没有梯度。为了计算 SIGReg，代码还会在线编码真实的 `z_{t+1}`；这不是 dynamics 的 target，也不改变 JEPA 的 stop-gradient 语义。
@@ -118,7 +121,7 @@ repeat epochs_per_rollout times:
 
 ```
 
-`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机起点更新。每个起点按唯一的 `PLANNING_HORIZON` 递归预测连续多步，所有有效预测步等权归一化；同一参数也控制粒子搜索的 reward-sum horizon，默认值为 20。
+`sample_rollouts` 决定一次 replay batch 合并的 episode/rollout 数，`epochs_per_rollout` 决定对此 batch 进行多少次随机起点更新。每个起点按唯一的 `PLANNING_HORIZON` 递归预测连续多步，所有有效预测步等权归一化；同一参数也控制粒子搜索的 reward horizon，搜索分数是 discounted reward sum 加 terminal clipped double-Q，默认 horizon 为 20。
 
 ## 验证与 Checkpoint
 
@@ -135,8 +138,10 @@ repeat epochs_per_rollout times:
 
 | 训练阶段 | 数据来源 | 直接优化参数 | 不直接优化参数 |
 | --- | --- | --- | --- |
-| Pretrain replay update | 随机 policy 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward head | 全部 EMA 模块 |
-| Formal replay update | 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward head | 全部 EMA 模块 |
+| Pretrain replay update | 随机 policy 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward head、Value head | 全部 EMA 模块 |
+| Formal replay update | 离线 image rollout | Observation encoder、Latent encoder、Transformer dynamics、Reward head、Value head | 全部 EMA 模块 |
 | EMA update | 在线参数快照 | 无梯度参数滑动平均 | 不适用 |
 
 EMA 模块从不通过反向传播更新；它们仅由每次 optimizer step 后的滑动平均得到。
+
+评估和对外 policy API 使用 EMA 副本：`encode`、`predict_next`、`predict_heads`、`evaluate_action`、`rollout` 以及粒子搜索中的 dynamics/reward/value 都不会读取在线模块。在线模块只用于训练 loss。

@@ -23,10 +23,12 @@ class TrainingConfig:
     jepa_weight: float = 1.0
     sigreg_weight: float = 0.2
     reward_weight: float = 1.0
+    value_weight: float = 1.0
     sigreg_projections: int = 256
     sigreg_frequencies: int = 17
     sigreg_max_frequency: float = 5.0
     planning_horizon: int = 20
+    discount: float = 0.99
 
     def __post_init__(self) -> None:
         if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
@@ -35,12 +37,15 @@ class TrainingConfig:
             raise ValueError("grad_clip_norm must be positive when provided.")
         if self.planning_horizon <= 0:
             raise ValueError("planning_horizon must be positive.")
+        if not 0.0 <= self.discount <= 1.0:
+            raise ValueError("discount must be in [0, 1].")
         if any(
             weight < 0.0
             for weight in (
                 self.jepa_weight,
                 self.sigreg_weight,
                 self.reward_weight,
+                self.value_weight,
             )
         ):
             raise ValueError("Loss weights must be non-negative.")
@@ -124,6 +129,7 @@ class WorldModelLosses:
     jepa: torch.Tensor
     sigreg: torch.Tensor
     reward: torch.Tensor
+    value: torch.Tensor
 
     def detached(self) -> dict[str, float]:
         return {
@@ -131,10 +137,13 @@ class WorldModelLosses:
             "jepa": self.jepa.detach().item(),
             "sigreg": self.sigreg.detach().item(),
             "reward": self.reward.detach().item(),
+            "value": self.value.detach().item(),
         }
 
 
-def tensor_episode_batch(batch: EpisodeBatch, model: WorldModel) -> TensorEpisodeBatch:
+def tensor_episode_batch(
+    batch: EpisodeBatch, model: WorldModel, discount: float = 0.99
+) -> TensorEpisodeBatch:
     """Loads images as BCHW tensors and constructs state/transition masks."""
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
@@ -149,7 +158,7 @@ def tensor_episode_batch(batch: EpisodeBatch, model: WorldModel) -> TensorEpisod
     time = actions.shape[1]
     transition_valid = torch.arange(time, device=device)[None] < lengths[:, None]
     state_valid = torch.arange(time + 1, device=device)[None] <= lengths[:, None]
-    returns = _returns_to_go(rewards, transition_valid)
+    returns = _returns_to_go(rewards, transition_valid, discount=discount)
     return TensorEpisodeBatch(
         observations, actions, rewards, returns, terminated, transition_valid, state_valid
     )
@@ -161,13 +170,14 @@ def sample_transition_batch(
     batch_size: int,
     rng: np.random.Generator,
     planning_horizon: int,
+    discount: float = 0.99,
 ) -> TensorTransitionBatch:
     """Samples transitions with their exact image and preceding-action histories."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     flat_indices = rng.integers(0, batch.num_transitions, size=batch_size)
     return transition_batch_from_indices(
-        batch, model, flat_indices, planning_horizon=planning_horizon
+        batch, model, flat_indices, planning_horizon=planning_horizon, discount=discount
     )
 
 
@@ -176,6 +186,7 @@ def transition_batch_from_indices(
     model: WorldModel,
     flat_indices: np.ndarray,
     planning_horizon: int,
+    discount: float = 0.99,
 ) -> TensorTransitionBatch:
     """Builds an aligned transition batch from flattened episode indices."""
     source = batch.images if batch.images is not None else batch.obs
@@ -234,9 +245,12 @@ def transition_batch_from_indices(
             transition = int(timestep + offset)
             actions[sample, offset] = batch.action[episode, transition]
             rewards[sample, offset, 0] = batch.reward[episode, transition]
-            next_returns[sample, offset, 0] = batch.reward[
-                episode, transition + 1 : lengths[episode]
-            ].sum()
+            future = batch.reward[episode, transition + 1 : lengths[episode]]
+            if len(future):
+                next_returns[sample, offset, 0] = sum(
+                    float(reward) * discount**power
+                    for power, reward in enumerate(future)
+                )
             terminated[sample, offset] = batch.terminated[episode, transition]
             transition_valid[sample, offset] = True
 
@@ -344,6 +358,7 @@ def world_model_loss(
     rollout_z = online_latents[:, :-1]
     jepa_errors = []
     reward_errors = []
+    value_errors = []
     rollout_valid = []
     rollout_steps = min(config.planning_horizon, batch.actions.shape[1])
     for offset in range(rollout_steps):
@@ -358,8 +373,21 @@ def world_model_loss(
         jepa_errors.append(
             (predicted_next_z - target_latents[:, offset + 1 :]).square().mean(dim=-1)
         )
+        q1, q2 = model.heads.q_values(rollout_z.flatten(0, 1), step_actions.flatten(0, 1))
+        with torch.no_grad():
+            next_actions = torch.cat((step_actions[:, 1:], torch.zeros_like(step_actions[:, :1])), dim=1)
+            target_q1, target_q2 = model.ema_heads.q_values(
+                target_latents[:, offset + 1 :].flatten(0, 1), next_actions.flatten(0, 1)
+            )
+            target_value = torch.minimum(target_q1, target_q2).reshape(*step_actions.shape[:2], 1)
         reward_errors.append(
             (predicted_reward - batch.rewards[:, offset:]).square().squeeze(-1)
+        )
+        value_errors.append(
+            (
+                torch.stack((q1.reshape(*step_actions.shape[:2], 1), q2.reshape(*step_actions.shape[:2], 1)), dim=0).mean(dim=0)
+                - (batch.rewards[:, offset:] + config.discount * (~batch.terminated[:, offset:]).to(batch.rewards.dtype) * target_value)
+            ).square().squeeze(-1)
         )
         rollout_valid.append(step_valid)
         rollout_z = predicted_next_z[:, :-1]
@@ -373,6 +401,9 @@ def world_model_loss(
     reward = _masked_mean(
         torch.cat([item.flatten() for item in reward_errors]), valid
     )
+    value = _masked_mean(
+        torch.cat([item.flatten() for item in value_errors]), valid
+    )
     sigreg = sigreg_loss(
         online_latents[batch.state_valid],
         config.sigreg_projections,
@@ -383,8 +414,9 @@ def world_model_loss(
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
+        + config.value_weight * value
     )
-    return WorldModelLosses(total, jepa, sigreg, reward)
+    return WorldModelLosses(total, jepa, sigreg, reward, value)
 
 
 def transition_world_model_loss(
@@ -442,6 +474,7 @@ def transition_world_model_loss(
     rollout_z = current_z
     jepa_errors = []
     reward_errors = []
+    value_errors = []
     for offset in range(batch.actions.shape[1]):
         action = batch.actions[:, offset]
         reward_errors.append(
@@ -449,6 +482,13 @@ def transition_world_model_loss(
             .square()
             .squeeze(-1)
         )
+        q1, q2 = model.heads.q_values(rollout_z, action)
+        with torch.no_grad():
+            next_action = batch.actions[:, offset + 1] if offset + 1 < batch.actions.shape[1] else torch.zeros_like(action)
+            target_q1, target_q2 = model.ema_heads.q_values(target_z[:, offset], next_action)
+            target_value = torch.minimum(target_q1, target_q2)
+        target = batch.rewards[:, offset] + config.discount * (~batch.terminated[:, offset, None]).to(batch.rewards.dtype) * target_value
+        value_errors.append(torch.stack(((q1 - target).square(), (q2 - target).square()), dim=0).mean(dim=0).squeeze(-1))
         rollout_z = model.predict_next_online(rollout_z, action)
         jepa_errors.append((rollout_z - target_z[:, offset]).square().mean(dim=-1))
     valid = batch.transition_valid.flatten().to(dtype=current_z.dtype)
@@ -460,12 +500,14 @@ def transition_world_model_loss(
         config.sigreg_max_frequency,
     )
     reward = _masked_mean(torch.stack(reward_errors, dim=1).flatten(), valid)
+    value = _masked_mean(torch.stack(value_errors, dim=1).flatten(), valid)
     total = (
         config.jepa_weight * jepa
         + config.sigreg_weight * sigreg
         + config.reward_weight * reward
+        + config.value_weight * value
     )
-    return WorldModelLosses(total, jepa, sigreg, reward)
+    return WorldModelLosses(total, jepa, sigreg, reward, value)
 
 
 class WorldModelTrainer:
@@ -480,7 +522,7 @@ class WorldModelTrainer:
 
     def train_batch(self, batch: EpisodeBatch) -> dict[str, float]:
         self.model.train()
-        tensor_batch = tensor_episode_batch(batch, self.model)
+        tensor_batch = tensor_episode_batch(batch, self.model, discount=self.config.discount)
         self.optimizer.zero_grad(set_to_none=True)
         losses = world_model_loss(self.model, tensor_batch, self.config)
         losses.total.backward()
@@ -500,6 +542,7 @@ class WorldModelTrainer:
             batch_size,
             rng,
             planning_horizon=self.config.planning_horizon,
+            discount=self.config.discount,
         )
         self.optimizer.zero_grad(set_to_none=True)
         losses = transition_world_model_loss(self.model, sampled, self.config)
@@ -533,6 +576,7 @@ class WorldModelTrainer:
                     self.model,
                     minibatch_indices[batch_indices == batch_index] - starts[batch_index],
                     planning_horizon=self.config.planning_horizon,
+                    discount=self.config.discount,
                 )
                 for batch_index in np.unique(batch_indices)
             ]
@@ -572,6 +616,7 @@ class WorldModelTrainer:
                     self.model,
                     minibatch_indices,
                     planning_horizon=self.config.planning_horizon,
+                    discount=self.config.discount,
                 )
                 metrics = transition_world_model_loss(
                     self.model, sampled, self.config
@@ -654,13 +699,16 @@ def _masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return (values * valid).sum() / count
 
 
-def _returns_to_go(rewards: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Returns undiscounted rewards following each state, with zero at episode end."""
+def _returns_to_go(
+    rewards: torch.Tensor, valid: torch.Tensor, discount: float = 0.99
+) -> torch.Tensor:
+    """Returns discounted rewards following each state, with zero at episode end."""
     masked_rewards = rewards * valid[:, :, None]
     returns = torch.zeros(
         (rewards.shape[0], rewards.shape[1] + 1, 1),
         device=rewards.device,
         dtype=rewards.dtype,
     )
-    returns[:, :-1] = masked_rewards.flip(1).cumsum(1).flip(1)
+    for timestep in range(rewards.shape[1] - 1, -1, -1):
+        returns[:, timestep] = masked_rewards[:, timestep] + discount * returns[:, timestep + 1]
     return returns

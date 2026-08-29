@@ -130,16 +130,26 @@ class LatentDynamics(nn.Module):
 @dataclass(frozen=True)
 class HeadOutput:
     reward: torch.Tensor
+    value: torch.Tensor
+    q1: torch.Tensor | None = None
+    q2: torch.Tensor | None = None
 
 
 class WorldHeads(nn.Module):
-    """Predicts transition reward."""
+    """Predicts transition reward and twin action-conditioned Q values."""
 
     def __init__(self, config: WorldModelConfig) -> None:
         super().__init__()
         self.latent_dim = config.latent_dim
         self.action_dim = config.action_dim
         self.reward_head = _scalar_head(config, config.latent_dim + config.action_dim)
+        self.q1_head = _scalar_head(config, config.latent_dim + config.action_dim)
+        self.q2_head = _scalar_head(config, config.latent_dim + config.action_dim)
+
+    @property
+    def value_head(self) -> nn.Sequential:
+        """Compatibility alias for the first Q head."""
+        return self.q1_head
 
     def forward(self, latent: torch.Tensor, action: torch.Tensor) -> HeadOutput:
         if latent.ndim != 2 or latent.shape[1] != self.latent_dim:
@@ -147,7 +157,8 @@ class WorldHeads(nn.Module):
         action = action.flatten(start_dim=1)
         if action.shape != (latent.shape[0], self.action_dim):
             raise ValueError(f"action must have shape [batch, {self.action_dim}].")
-        return HeadOutput(self.reward_head(torch.cat((latent, action), dim=-1)))
+        q1, q2 = self.q_values(latent, action)
+        return HeadOutput(self.reward_head(torch.cat((latent, action), dim=-1)), torch.minimum(q1, q2), q1, q2)
 
     def reward(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         action = action.flatten(start_dim=1)
@@ -156,6 +167,20 @@ class WorldHeads(nn.Module):
         if action.shape != (latent.shape[0], self.action_dim):
             raise ValueError(f"action must have shape [batch, {self.action_dim}].")
         return self.reward_head(torch.cat((latent, action), dim=-1))
+
+    def value(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        q1, q2 = self.q_values(latent, action)
+        return torch.minimum(q1, q2)
+
+    def q_values(self, latent: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if latent.ndim != 2 or latent.shape[1] != self.latent_dim:
+            raise ValueError(f"latent must have shape [batch, {self.latent_dim}].")
+        action = action.flatten(start_dim=1)
+        if action.shape != (latent.shape[0], self.action_dim):
+            raise ValueError(f"action must have shape [batch, {self.action_dim}].")
+        inputs = torch.cat((latent, action), dim=-1)
+        return self.q1_head(inputs), self.q2_head(inputs)
+
 
 @dataclass(frozen=True)
 class ActionEvaluation:
@@ -168,6 +193,7 @@ class ActionEvaluation:
 class RolloutOutput:
     latents: torch.Tensor
     rewards: torch.Tensor
+    values: torch.Tensor
     scores: torch.Tensor
     final_z: torch.Tensor
     final_action_history: torch.Tensor
@@ -295,7 +321,7 @@ class WorldModel(nn.Module):
 
     def evaluate_action_online(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_online(z, action)
-        heads = HeadOutput(self.heads.reward(z, action))
+        heads = self.heads(z, action)
         return ActionEvaluation(next_z, heads, heads.reward)
 
     @torch.no_grad()
@@ -305,7 +331,7 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     def evaluate_action_ema(self, z: torch.Tensor, action: torch.Tensor) -> ActionEvaluation:
         next_z = self.predict_next_ema(z, action)
-        heads = HeadOutput(self.ema_heads.reward(z, action))
+        heads = self.ema_heads(z, action)
         return ActionEvaluation(next_z, heads, heads.reward)
 
     @torch.no_grad()
@@ -375,7 +401,7 @@ class WorldModel(nn.Module):
             action_valid_mask = torch.ones(
                 action_history.shape[:2], dtype=torch.bool, device=action_history.device
             )
-        latents, rewards, scores = [], [], []
+        latents, rewards, values, scores = [], [], [], []
         evaluate = self.evaluate_action_online if online else self.evaluate_action_ema
         for action in actions.unbind(dim=1):
             evaluation = evaluate(z, action)
@@ -385,10 +411,12 @@ class WorldModel(nn.Module):
             )
             latents.append(z)
             rewards.append(evaluation.heads.reward)
+            values.append(evaluation.heads.value)
             scores.append(evaluation.heads.reward)
         return RolloutOutput(
             torch.stack(latents, dim=1),
             torch.stack(rewards, dim=1),
+            torch.stack(values, dim=1),
             torch.stack(scores, dim=1),
             z,
             action_history,
