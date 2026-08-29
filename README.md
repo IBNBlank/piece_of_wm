@@ -7,7 +7,7 @@ World-model data collection utilities with a sequence-preserving replay buffer.
 source .venv/bin/activate
 
 # Each rollout file contains NUM_ENVS complete episodes and optional 128x128 images.
-NUM_ENVS=4 ROLLOUTS=100 ./run_collect_data.sh --env-id Pendulum-v1 --output-dir dataset/pendulum-random
+NUM_ENVS=4 ROLLOUTS=100 ./run_collect_data.sh --env-id FetchPickAndPlace-v4 --output-dir dataset/fetch-pick-and-place-random
 ```
 
 `collect_data.py` writes complete episode batches. Offline pretraining reads
@@ -18,13 +18,13 @@ Formal online training uses the persistent replay buffer under
 Each rollout stores `obs` with shape `(NUM_ENVS, T + 1, ...)`, transition arrays
 with shape `(NUM_ENVS, T, ...)`, and `lengths` to mask padded time steps.
 
-## Train Trans-WM
+## Train Dreamer-like
 
 Pretrain the world-model components before multi-step reward planning:
 
 ```bash
-./run_pretrain_trans_wm.sh
-# Or: ./run_pretrain_trans_wm_le.sh
+./run_pretrain_dreamer_like.sh
+# Or: ./run_pretrain_tdmpc_like.sh
 ```
 
 Run pretraining, formal training, and final online evaluation sequentially with
@@ -32,11 +32,11 @@ one command:
 
 ```bash
 DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
-./run_integrate_trans_wm.sh
+./run_integrate_dreamer_like.sh
 
-# Trans-WM-LE:
+# TD-MPC-like:
 DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
-./run_integrate_trans_wm_le.sh
+./run_integrate_tdmpc_like.sh
 ```
 
 The integrated runners start each stage from scratch by default. Set
@@ -54,12 +54,12 @@ controls validation and checkpoint frequency.
 Start formal training from the best pretraining checkpoint with:
 
 ```bash
-PRETRAINED_CHECKPOINT=runs/trans_wm_pretrain/checkpoint_best.pt \
-./run_train_trans_wm.sh
+PRETRAINED_CHECKPOINT=runs/dreamer_like_pretrain/checkpoint_best.pt \
+./run_train_dreamer_like.sh
 
-# Trans-WM-LE:
-PRETRAINED_CHECKPOINT=runs/trans_wm_le_pretrain/checkpoint_best.pt \
-./run_train_trans_wm_le.sh
+# TD-MPC-like:
+PRETRAINED_CHECKPOINT=runs/tdmpc_like_pretrain/checkpoint_best.pt \
+./run_train_tdmpc_like.sh
 ```
 
 `PRETRAINED_CHECKPOINT` restores only model weights; the
@@ -71,19 +71,19 @@ To train the CNN/Transformer world model without a
 pretraining phase, run:
 
 ```bash
-./run_train_trans_wm.sh
+./run_train_dreamer_like.sh
 ```
 
-The default input is `dataset/pendulum-random`, and checkpoints and metrics are
-written to `runs/trans_wm`. Common overrides are supplied through environment
+The default input is `dataset/fetch-pick-and-place-random`, and checkpoints and metrics are
+written to `runs/dreamer_like`. Common overrides are supplied through environment
 variables:
 
 ```bash
-DATA_DIR=dataset/pendulum-random \
-OUTPUT_DIR=runs/trans_wm-pendulum \
+DATA_DIR=dataset/fetch-pick-and-place-random \
+OUTPUT_DIR=runs/dreamer_like-fetch \
 ROLLOUTS=500 NUM_ENVS=10 MAX_STEPS=200 \
 BATCH_SIZE=16 DEVICE=cuda \
-./run_train_trans_wm.sh
+./run_train_dreamer_like.sh
 ```
 
 `NUM_ENVS` and `MAX_STEPS` are checked against `dataset.json` before training,
@@ -97,8 +97,8 @@ directory and keep the matching model/training arguments in `EXTRA_ARGS`. A run
 directory automatically selects its newest numbered checkpoint:
 
 ```bash
-RESUME=runs/trans_wm ROLLOUTS=1000 \
-./run_train_trans_wm.sh
+RESUME=runs/dreamer_like ROLLOUTS=1000 \
+./run_train_dreamer_like.sh
 ```
 
 At startup, formal online training imports the rollout files into a RAM-resident
@@ -127,8 +127,8 @@ Gymnasium environment. Candidate actions are selected with the particle policy;
 the rollout dataset is not used by evaluation.
 
 ```bash
-MODEL=trans_wm_le \
-TRANS_WM_LE_CHECKPOINT=runs/trans_wm_le/checkpoint_best.pt \
+MODEL=tdmpc_like \
+TDMPC_LIKE_CHECKPOINT=runs/tdmpc_like/checkpoint_best.pt \
 EPISODES=5 DEVICE=cuda \
 ./run_eval.sh
 ```

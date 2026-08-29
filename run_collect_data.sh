@@ -4,16 +4,16 @@
 #
 # Usage:
 #   ./run_collect_data.sh
-#   ENV_ID=Pendulum-v1 ROLLOUTS=20 SEED=42 ./run_collect_data.sh
+#   ENV_ID=FetchPickAndPlace-v4 ROLLOUTS=20 SEED=42 ./run_collect_data.sh
 #
 # Tunables (env vars):
 #   PYTHON      : Python interpreter (takes precedence over virtualenv choices)
-#   ENV_ID      : Gymnasium environment (default: Pendulum-v1)
+#   ENV_ID      : Gymnasium environment (default: FetchPickAndPlace-v4)
 #   ROLLOUTS    : number of random-policy rollouts (default: 100)
 #   MAX_STEPS   : maximum steps per environment trajectory in a rollout (default: 200)
 #   NUM_ENVS    : environments included in every rollout (default: 10)
 #   SEED        : random seed (default: 0)
-#   OUTPUT_DIR  : directory for per-rollout .npz files (default: data/pendulum-random)
+#   OUTPUT_DIR  : directory for per-rollout .npz files (default: data/fetch-pick-and-place-random)
 #   EXTRA_ARGS  : extra CLI arguments forwarded to collect_data.py
 ###############################################################################
 set -u
@@ -36,12 +36,12 @@ if [ ! -x "${PYTHON}" ]; then
 	exit 1
 fi
 
-ENV_ID="${ENV_ID:-Pendulum-v1}"
+ENV_ID="${ENV_ID:-FetchPickAndPlace-v4}"
 ROLLOUTS="${ROLLOUTS:-20}"
 MAX_STEPS="${MAX_STEPS:-200}"
 NUM_ENVS="${NUM_ENVS:-20}"
 SEED="${SEED:-0}"
-OUTPUT_DIR="${OUTPUT_DIR:-dataset/pendulum-random}"
+OUTPUT_DIR="${OUTPUT_DIR:-dataset/fetch-pick-and-place-random}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"

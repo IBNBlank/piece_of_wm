@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 ###############################################################################
-# Train Trans-WM-LE from sequence-preserving image rollouts.
+# Train TD-MPC-like from sequence-preserving image rollouts.
 #
 # Usage:
-#   ./run_train_trans_wm_le.sh
-#   ROLLOUTS=500 BATCH_SIZE=16 DEVICE=cuda ./run_train_trans_wm_le.sh
-#   JEPA_WEIGHT=1.0 SIGREG_WEIGHT=0.2 ./run_train_trans_wm_le.sh
+#   ./run_train_tdmpc_like.sh
+#   ROLLOUTS=500 BATCH_SIZE=16 DEVICE=cuda ./run_train_tdmpc_like.sh
+#   JEPA_WEIGHT=1.0 SIGREG_WEIGHT=0.2 ./run_train_tdmpc_like.sh
 #
 # Tunables (env vars):
 #   PYTHON                : Python interpreter
-#   DATA_DIR              : rollout dataset directory (default: dataset/pendulum-random)
-#   OUTPUT_DIR            : checkpoints and metrics directory (default: runs/trans_wm_le)
+#   DATA_DIR              : rollout dataset directory (default: dataset/fetch-pick-and-place-random)
+#   OUTPUT_DIR            : checkpoints and metrics directory (default: runs/tdmpc_like)
 #   NUM_ENVS              : environments per collected rollout (default: 20)
 #   MAX_STEPS             : maximum steps per environment episode (default: 200)
 #   ROLLOUTS              : number of rollout training units (default: 500)
@@ -29,7 +29,7 @@
 #   DEVICE                : torch device; empty selects CUDA when available
 #   RESUME                : checkpoint path to resume (default: empty)
 #   PRETRAINED_CHECKPOINT : pretraining checkpoint used to initialize training
-#                           (default: runs/trans_wm_le_pretrain/checkpoint_best.pt)
+#                           (default: runs/tdmpc_like_pretrain/checkpoint_best.pt)
 #   LEARNING_RATE         : AdamW learning rate (default: 1e-4)
 #   WEIGHT_DECAY          : AdamW weight decay (default: 1e-5)
 #   GRAD_CLIP_NORM        : gradient clipping norm (default: 10.0)
@@ -38,7 +38,7 @@
 #   SIGREG_PROJECTIONS    : random SIGReg projections (default: 256)
 #   SIGREG_FREQUENCIES    : frequencies per SIGReg projection (default: 17)
 #   SIGREG_MAX_FREQUENCY  : maximum SIGReg frequency (default: 5.0)
-#   EXTRA_ARGS            : additional arguments forwarded to trans_wm_le.train
+#   EXTRA_ARGS            : additional arguments forwarded to tdmpc_like.train
 ###############################################################################
 set -Eeuo pipefail
 
@@ -54,13 +54,13 @@ else
 fi
 
 if [ ! -x "${PYTHON}" ]; then
-	echo "[run_train_trans_wm_le] error: Python executable not found: ${PYTHON}" >&2
-	echo "[run_train_trans_wm_le] run ./venv.sh or set PYTHON=/path/to/python" >&2
+	echo "[run_train_tdmpc_like] error: Python executable not found: ${PYTHON}" >&2
+	echo "[run_train_tdmpc_like] run ./venv.sh or set PYTHON=/path/to/python" >&2
 	exit 1
 fi
 
-DATA_DIR="${DATA_DIR:-dataset/pendulum-random}"
-OUTPUT_DIR="${OUTPUT_DIR:-runs/trans_wm_le}"
+DATA_DIR="${DATA_DIR:-dataset/fetch-pick-and-place-random}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/tdmpc_like}"
 NUM_ENVS="${NUM_ENVS:-20}"
 MAX_STEPS="${MAX_STEPS:-200}"
 ROLLOUTS="${ROLLOUTS:-500}"
@@ -81,7 +81,7 @@ RESUME="${RESUME:-}"
 if [ -n "${RESUME}" ]; then
 	PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-}"
 else
-	PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-runs/trans_wm_le_pretrain/checkpoint_best.pt}"
+	PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-runs/tdmpc_like_pretrain/checkpoint_best.pt}"
 fi
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
@@ -94,7 +94,7 @@ SIGREG_MAX_FREQUENCY="${SIGREG_MAX_FREQUENCY:-5.0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [ -n "${RESUME}" ] && [ -n "${PRETRAINED_CHECKPOINT}" ]; then
-	echo "[run_train_trans_wm_le] error: RESUME and PRETRAINED_CHECKPOINT are mutually exclusive" >&2
+	echo "[run_train_tdmpc_like] error: RESUME and PRETRAINED_CHECKPOINT are mutually exclusive" >&2
 	exit 1
 fi
 
@@ -139,10 +139,10 @@ if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
 	args+=(--pretrained-checkpoint "${PRETRAINED_CHECKPOINT}")
 fi
 
-echo "[run_train_trans_wm_le] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
-echo "[run_train_trans_wm_le] pretrained_checkpoint=${PRETRAINED_CHECKPOINT:-none}"
-echo "[run_train_trans_wm_le] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
-echo "[run_train_trans_wm_le] jepa_weight=${JEPA_WEIGHT} sigreg_weight=${SIGREG_WEIGHT}"
+echo "[run_train_tdmpc_like] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
+echo "[run_train_tdmpc_like] pretrained_checkpoint=${PRETRAINED_CHECKPOINT:-none}"
+echo "[run_train_tdmpc_like] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
+echo "[run_train_tdmpc_like] jepa_weight=${JEPA_WEIGHT} sigreg_weight=${SIGREG_WEIGHT}"
 
 # shellcheck disable=SC2086
-"${PYTHON}" -m trans_wm_le.train "${args[@]}" ${EXTRA_ARGS} "$@"
+"${PYTHON}" -m tdmpc_like.train "${args[@]}" ${EXTRA_ARGS} "$@"

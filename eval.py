@@ -27,17 +27,17 @@ ACTION_HISTORY_LEN = 2
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("all", "trans_wm", "trans_wm_le"), default="all")
-    parser.add_argument("--env-id", default="Pendulum-v1")
+    parser.add_argument("--model", choices=("all", "dreamer_like", "tdmpc_like"), default="all")
+    parser.add_argument("--env-id", default="FetchPickAndPlace-v4")
     parser.add_argument(
-        "--trans-wm-checkpoint",
+        "--dreamer-like-checkpoint",
         type=Path,
-        default=Path("runs/trans_wm/checkpoint_best.pt"),
+        default=Path("runs/dreamer_like/checkpoint_best.pt"),
     )
     parser.add_argument(
-        "--trans-wm-le-checkpoint",
+        "--tdmpc-like-checkpoint",
         type=Path,
-        default=Path("runs/trans_wm_le/checkpoint_best.pt"),
+        default=Path("runs/tdmpc_like/checkpoint_best.pt"),
     )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=200)
@@ -78,8 +78,8 @@ def main() -> None:
         args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     checkpoints = {
-        "trans_wm": args.trans_wm_checkpoint,
-        "trans_wm_le": args.trans_wm_le_checkpoint,
+        "dreamer_like": args.dreamer_like_checkpoint,
+        "tdmpc_like": args.tdmpc_like_checkpoint,
     }
     model_names = tuple(checkpoints) if args.model == "all" else (args.model,)
     baseline_returns = evaluate_random_policy(
@@ -374,10 +374,12 @@ def evaluate_random_policy(env_id: str, episodes: int, max_steps: int, seed: int
 
 
 def _validate_policy_environment(env_id: str, model: Any) -> None:
-    if env_id != "Pendulum-v1":
-        raise ValueError("ParticlePolicy currently supports only Pendulum-v1.")
-    if model.config.action_shape != (1,):
-        raise ValueError("Pendulum online evaluation requires checkpoint action_shape=(1,).")
+    if env_id != "FetchPickAndPlace-v4":
+        raise ValueError("This project supports only FetchPickAndPlace-v4.")
+    if len(model.config.action_shape) != 1 or model.config.action_shape[0] <= 0:
+        raise ValueError("Fetch checkpoint action_shape must describe a flat action vector.")
+    if model.config.action_shape != (4,):
+        raise ValueError("FetchPickAndPlace-v4 checkpoints must use action_shape=(4,).")
 
 
 def _render_model_image(env: Any, observation_shape: tuple[int, int, int]) -> np.ndarray:
@@ -434,7 +436,7 @@ def _online_video_frame(
     draw = ImageDraw.Draw(canvas)
     draw.text((520, 30), "ONLINE ENVIRONMENT", fill=(0, 100, 60))
     draw.text((520, 70), f"step: {timestep}", fill="black")
-    draw.text((520, 100), f"action: {float(action.item()):.3f}", fill="black")
+    draw.text((520, 100), f"action: {np.asarray(action).reshape(-1).round(3).tolist()}", fill="black")
     draw.text((520, 130), f"reward: {rewards[-1]:.3f}", fill="black")
     draw.text((520, 160), f"pred reward: {predicted_rewards[-1]:.3f}", fill="black")
     draw.text((520, 220), f"return: {sum(rewards):.3f}", fill="black")

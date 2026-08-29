@@ -1,4 +1,4 @@
-"""JEPA, SIGReg, and task losses for the latent world model."""
+"""Masked sequence losses and optimization for the image-history world model."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from trans_wm_le.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN
-from trans_wm_le.history import append_history, history_windows, previous_history_windows
-from trans_wm_le.model import WorldModel
+from dreamer_like.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN
+from dreamer_like.history import append_history, history_windows, previous_history_windows
+from dreamer_like.model import WorldModel
 from utils.replay_buffer import EpisodeBatch, RolloutReplayBuffer
 
 
@@ -20,12 +20,10 @@ class TrainingConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-5
     grad_clip_norm: float | None = 100.0
-    jepa_weight: float = 1.0
-    sigreg_weight: float = 0.2
+    observation_weight: float = 1.0
     reward_weight: float = 1.0
-    sigreg_projections: int = 256
-    sigreg_frequencies: int = 17
-    sigreg_max_frequency: float = 5.0
+    vae_reconstruction_weight: float = 1.0
+    vae_kl_weight: float = 1e-4
     planning_horizon: int = 20
 
     def __post_init__(self) -> None:
@@ -38,16 +36,13 @@ class TrainingConfig:
         if any(
             weight < 0.0
             for weight in (
-                self.jepa_weight,
-                self.sigreg_weight,
+                self.observation_weight,
                 self.reward_weight,
+                self.vae_reconstruction_weight,
+                self.vae_kl_weight,
             )
         ):
             raise ValueError("Loss weights must be non-negative.")
-        if self.sigreg_projections <= 0 or self.sigreg_frequencies <= 0:
-            raise ValueError("SIGReg projections and frequencies must be positive.")
-        if self.sigreg_max_frequency <= 0.0:
-            raise ValueError("sigreg_max_frequency must be positive.")
 
 
 @dataclass(frozen=True)
@@ -121,16 +116,18 @@ class TensorTransitionBatch:
 @dataclass(frozen=True)
 class WorldModelLosses:
     total: torch.Tensor
-    jepa: torch.Tensor
-    sigreg: torch.Tensor
+    observation: torch.Tensor
     reward: torch.Tensor
+    vae_reconstruction: torch.Tensor
+    vae_kl: torch.Tensor
 
     def detached(self) -> dict[str, float]:
         return {
             "total": self.total.detach().item(),
-            "jepa": self.jepa.detach().item(),
-            "sigreg": self.sigreg.detach().item(),
+            "observation": self.observation.detach().item(),
             "reward": self.reward.detach().item(),
+            "vae_reconstruction": self.vae_reconstruction.detach().item(),
+            "vae_kl": self.vae_kl.detach().item(),
         }
 
 
@@ -162,7 +159,7 @@ def sample_transition_batch(
     rng: np.random.Generator,
     planning_horizon: int,
 ) -> TensorTransitionBatch:
-    """Samples transitions with their exact image and preceding-action histories."""
+    """Samples transitions with their exact image and action histories."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     flat_indices = rng.integers(0, batch.num_transitions, size=batch_size)
@@ -180,7 +177,7 @@ def transition_batch_from_indices(
     """Builds an aligned transition batch from flattened episode indices."""
     source = batch.images if batch.images is not None else batch.obs
     if source.ndim != 5:
-        raise ValueError("Trans-WM-LE training requires image observations.")
+        raise ValueError("Dreamer-like training requires image observations.")
     flat_indices = np.asarray(flat_indices, dtype=np.int64)
     if flat_indices.ndim != 1 or len(flat_indices) == 0:
         raise ValueError("flat_indices must be a non-empty one-dimensional array.")
@@ -270,7 +267,7 @@ def concatenate_transition_batches(
 def encode_sequence(
     model: WorldModel, batch: TensorEpisodeBatch
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns one action-conditioned latent per valid state and its image windows."""
+    """Returns one z per state plus the exact image windows and masks used."""
     obs_windows, obs_masks = history_windows(
         batch.observations, batch.state_valid, OBS_HISTORY_LEN
     )
@@ -282,39 +279,20 @@ def encode_sequence(
         action_windows.flatten(0, 1),
         action_masks.flatten(0, 1),
     )
-    return latents.reshape(batch_size, states, model.config.latent_dim), obs_windows, obs_masks
+    return (
+        latents.reshape(batch_size, states, model.config.latent_dim),
+        obs_windows,
+        obs_masks,
+    )
 
 
-def sigreg_loss(
-    latents: torch.Tensor,
-    num_projections: int = 256,
-    num_frequencies: int = 17,
-    max_frequency: float = 5.0,
-) -> torch.Tensor:
-    """Matches projected latent characteristic functions to a standard Gaussian."""
-    if latents.ndim != 2 or latents.shape[0] == 0:
-        raise ValueError("latents must have non-empty shape [samples, latent_dim].")
-    if num_projections <= 0 or num_frequencies <= 0 or max_frequency <= 0.0:
-        raise ValueError("SIGReg sampling parameters must be positive.")
-    directions = torch.randn(
-        latents.shape[1], num_projections, device=latents.device, dtype=latents.dtype
-    )
-    directions = directions / directions.norm(dim=0, keepdim=True).clamp_min(
-        torch.finfo(latents.dtype).eps
-    )
-    projected = latents @ directions
-    frequencies = torch.linspace(
-        max_frequency / num_frequencies,
-        max_frequency,
-        num_frequencies,
-        device=latents.device,
-        dtype=latents.dtype,
-    )
-    phases = projected[:, :, None] * frequencies
-    empirical_real = phases.cos().mean(dim=0)
-    empirical_imag = phases.sin().mean(dim=0)
-    gaussian_real = torch.exp(-0.5 * frequencies.square())[None]
-    return ((empirical_real - gaussian_real).square() + empirical_imag.square()).mean()
+def vae_kl_loss(mean: torch.Tensor, log_variance: torch.Tensor) -> torch.Tensor:
+    """Standard-normal posterior KL, reduced over latent dimensions per sample."""
+    if mean.shape != log_variance.shape or mean.ndim != 2:
+        raise ValueError("mean and log_variance must have shape [batch, latent_dim].")
+    return -0.5 * (
+        1.0 + log_variance - mean.square() - log_variance.exp()
+    ).mean(dim=-1)
 
 
 def world_model_loss(
@@ -322,27 +300,28 @@ def world_model_loss(
     batch: TensorEpisodeBatch,
     config: TrainingConfig,
 ) -> WorldModelLosses:
+    """Computes task losses plus same-window VAE reconstruction and KL."""
     obs_windows, obs_masks = history_windows(
         batch.observations, batch.state_valid, OBS_HISTORY_LEN
     )
-    action_windows, action_masks = _state_action_windows(batch)
     batch_size, states = batch.observations.shape[:2]
-    online_latents = model.encode_online(
-        obs_windows.flatten(0, 1),
-        obs_masks.flatten(0, 1),
+    flat_windows = obs_windows.flatten(0, 1)
+    flat_masks = obs_masks.flatten(0, 1)
+    action_windows, action_masks = _state_action_windows(batch)
+    posterior = model.posterior_online(
+        flat_windows,
+        flat_masks,
         action_windows.flatten(0, 1),
         action_masks.flatten(0, 1),
-    ).reshape(batch_size, states, model.config.latent_dim)
-    with torch.no_grad():
-        target_latents = model.encode_ema(
-            obs_windows.flatten(0, 1),
-            obs_masks.flatten(0, 1),
-            action_windows.flatten(0, 1),
-            action_masks.flatten(0, 1),
-        ).reshape(batch_size, states, model.config.latent_dim)
-
-    rollout_z = online_latents[:, :-1]
-    jepa_errors = []
+    )
+    latents = posterior.mean.reshape(batch_size, states, model.config.latent_dim)
+    vae_reconstruction = model.heads.observation_head(posterior.rsample())
+    vae_reconstruction_per_state = (
+        (vae_reconstruction - flat_windows).flatten(1).square().mean(dim=1)
+    )
+    vae_kl_per_state = vae_kl_loss(posterior.mean, posterior.log_variance)
+    rollout_z = latents[:, :-1]
+    observation_errors = []
     reward_errors = []
     rollout_valid = []
     rollout_steps = min(config.planning_horizon, batch.actions.shape[1])
@@ -353,38 +332,44 @@ def world_model_loss(
             rollout_z.flatten(0, 1), step_actions.flatten(0, 1)
         ).reshape(*step_actions.shape[:2], 1)
         predicted_next_z = model.predict_next_online(
-            rollout_z.flatten(0, 1), step_actions.flatten(0, 1)
+            rollout_z.flatten(0, 1),
+            step_actions.flatten(0, 1),
         ).reshape(*step_actions.shape[:2], model.config.latent_dim)
-        jepa_errors.append(
-            (predicted_next_z - target_latents[:, offset + 1 :]).square().mean(dim=-1)
+        predicted_observation = model.heads.observation_head(
+            predicted_next_z.flatten(0, 1)
+        ).reshape(*step_actions.shape[:2], *obs_windows.shape[2:])
+        observation_errors.append(
+            (predicted_observation - obs_windows[:, offset + 1 :])
+            .flatten(start_dim=2)
+            .square()
+            .mean(dim=2)
         )
         reward_errors.append(
             (predicted_reward - batch.rewards[:, offset:]).square().squeeze(-1)
         )
         rollout_valid.append(step_valid)
-        rollout_z = predicted_next_z[:, :-1]
+        if offset + 1 < rollout_steps:
+            rollout_z = predicted_next_z[:, :-1]
 
-    valid = torch.cat([item.flatten() for item in rollout_valid]).to(
-        dtype=online_latents.dtype
+    valid = torch.cat([item.flatten() for item in rollout_valid]).to(dtype=latents.dtype)
+    observation_loss = _masked_mean(
+        torch.cat([item.flatten() for item in observation_errors]), valid
     )
-    jepa = _masked_mean(
-        torch.cat([item.flatten() for item in jepa_errors]), valid
-    )
-    reward = _masked_mean(
+    reward_loss = _masked_mean(
         torch.cat([item.flatten() for item in reward_errors]), valid
     )
-    sigreg = sigreg_loss(
-        online_latents[batch.state_valid],
-        config.sigreg_projections,
-        config.sigreg_frequencies,
-        config.sigreg_max_frequency,
-    )
+    state_valid = batch.state_valid.flatten().to(dtype=latents.dtype)
+    vae_reconstruction_loss = _masked_mean(vae_reconstruction_per_state, state_valid)
+    vae_kl = _masked_mean(vae_kl_per_state, state_valid)
     total = (
-        config.jepa_weight * jepa
-        + config.sigreg_weight * sigreg
-        + config.reward_weight * reward
+        config.observation_weight * observation_loss
+        + config.reward_weight * reward_loss
+        + config.vae_reconstruction_weight * vae_reconstruction_loss
+        + config.vae_kl_weight * vae_kl
     )
-    return WorldModelLosses(total, jepa, sigreg, reward)
+    return WorldModelLosses(
+        total, observation_loss, reward_loss, vae_reconstruction_loss, vae_kl
+    )
 
 
 def transition_world_model_loss(
@@ -392,83 +377,102 @@ def transition_world_model_loss(
     batch: TensorTransitionBatch,
     config: TrainingConfig,
 ) -> WorldModelLosses:
-    current_z = model.encode_online(
+    """Computes task and same-window VAE objectives on sampled transitions."""
+    current_posterior = model.posterior_online(
         batch.current_observations,
         batch.current_obs_valid,
         batch.action_history,
         batch.action_valid,
     )
-    target_histories = []
-    target_history_valid = []
-    action_history = batch.action_history
-    action_valid = batch.action_valid
-    for offset in range(batch.actions.shape[1]):
-        action_history, action_valid = append_history(
-            action_history, action_valid, batch.actions[:, offset]
-        )
-        target_histories.append(action_history)
-        target_history_valid.append(action_valid)
-    target_online_latents = []
-    target_latents = []
-    for offset, (target_history, target_valid) in enumerate(
-        zip(target_histories, target_history_valid, strict=True)
-    ):
+    batch_size, horizon = batch.actions.shape[:2]
+    rollout_z = current_posterior.mean
+    rollout_history = batch.action_history
+    rollout_history_valid = batch.action_valid
+    observation_errors = []
+    reward_errors = []
+    target_vae_errors = []
+    target_vae_kls = []
+    for offset in range(horizon):
+        action = batch.actions[:, offset]
         target_observation = batch.observations[
             :, offset + 1 : offset + 1 + OBS_HISTORY_LEN
         ]
         target_obs_valid = batch.obs_valid[
             :, offset + 1 : offset + 1 + OBS_HISTORY_LEN
         ]
-        target_online_latents.append(
-            model.encode_online(
-                target_observation,
-                target_obs_valid,
-                target_history,
-                target_valid,
-            )
+        rollout_history, rollout_history_valid = append_history(
+            rollout_history, rollout_history_valid, action
         )
-        with torch.no_grad():
-            target_latents.append(
-                model.encode_ema(
-                    target_observation,
-                    target_obs_valid,
-                    target_history,
-                    target_valid,
-                )
-            )
-    target_online_z = torch.stack(target_online_latents, dim=1)
-    target_z = torch.stack(target_latents, dim=1)
-
-    rollout_z = current_z
-    jepa_errors = []
-    reward_errors = []
-    for offset in range(batch.actions.shape[1]):
-        action = batch.actions[:, offset]
+        target_posterior = model.posterior_online(
+            target_observation,
+            target_obs_valid,
+            rollout_history,
+            rollout_history_valid,
+        )
         reward_errors.append(
             (model.heads.reward(rollout_z, action) - batch.rewards[:, offset])
             .square()
             .squeeze(-1)
         )
         rollout_z = model.predict_next_online(rollout_z, action)
-        jepa_errors.append((rollout_z - target_z[:, offset]).square().mean(dim=-1))
-    valid = batch.transition_valid.flatten().to(dtype=current_z.dtype)
-    jepa = _masked_mean(torch.stack(jepa_errors, dim=1).flatten(), valid)
-    sigreg = sigreg_loss(
-        torch.cat((current_z, target_online_z[batch.transition_valid]), dim=0),
-        config.sigreg_projections,
-        config.sigreg_frequencies,
-        config.sigreg_max_frequency,
+        observation_errors.append(
+            (model.heads.observation_head(rollout_z) - target_observation)
+            .flatten(1)
+            .square()
+            .mean(dim=1)
+        )
+        target_vae_errors.append(
+            (model.heads.observation_head(target_posterior.rsample()) - target_observation)
+            .flatten(1)
+            .square()
+            .mean(dim=1)
+        )
+        target_vae_kls.append(
+            vae_kl_loss(target_posterior.mean, target_posterior.log_variance)
+        )
+    valid = batch.transition_valid.flatten().to(dtype=rollout_z.dtype)
+    observation_loss = _masked_mean(torch.stack(observation_errors, dim=1).flatten(), valid)
+    reward_loss = _masked_mean(torch.stack(reward_errors, dim=1).flatten(), valid)
+    current_vae_reconstruction = model.heads.observation_head(current_posterior.rsample())
+    vae_reconstruction_per_state = torch.cat(
+        (
+            (current_vae_reconstruction - batch.current_observations)
+            .flatten(1)
+            .square()
+            .mean(dim=1),
+            torch.stack(target_vae_errors, dim=1).flatten(),
+        )
     )
-    reward = _masked_mean(torch.stack(reward_errors, dim=1).flatten(), valid)
+    state_valid = torch.cat(
+        (
+            torch.ones(batch_size, device=valid.device, dtype=valid.dtype),
+            valid,
+        )
+    )
+    vae_reconstruction_loss = _masked_mean(vae_reconstruction_per_state, state_valid)
+    vae_kl = _masked_mean(
+        torch.cat(
+            (
+                vae_kl_loss(current_posterior.mean, current_posterior.log_variance),
+                torch.stack(target_vae_kls, dim=1).flatten(),
+            )
+        ),
+        state_valid,
+    )
     total = (
-        config.jepa_weight * jepa
-        + config.sigreg_weight * sigreg
-        + config.reward_weight * reward
+        config.observation_weight * observation_loss
+        + config.reward_weight * reward_loss
+        + config.vae_reconstruction_weight * vae_reconstruction_loss
+        + config.vae_kl_weight * vae_kl
     )
-    return WorldModelLosses(total, jepa, sigreg, reward)
+    return WorldModelLosses(
+        total, observation_loss, reward_loss, vae_reconstruction_loss, vae_kl
+    )
 
 
 class WorldModelTrainer:
+    """Optimizes the world model without owning or assuming a policy."""
+
     def __init__(self, model: WorldModel, config: TrainingConfig | None = None) -> None:
         self.model = model
         self.config = config or TrainingConfig()
@@ -484,7 +488,13 @@ class WorldModelTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         losses = world_model_loss(self.model, tensor_batch, self.config)
         losses.total.backward()
-        self._finish_step()
+        if self.config.grad_clip_norm is not None:
+            nn.utils.clip_grad_norm_(
+                (parameter for parameter in self.model.parameters() if parameter.requires_grad),
+                self.config.grad_clip_norm,
+            )
+        self.optimizer.step()
+        self.model.update_target()
         return losses.detached()
 
     def train_transitions(
@@ -493,6 +503,7 @@ class WorldModelTrainer:
         batch_size: int,
         rng: np.random.Generator,
     ) -> dict[str, float]:
+        """Trains from sampled transitions without materializing full sequence windows."""
         self.model.train()
         sampled = sample_transition_batch(
             batch,
@@ -504,7 +515,13 @@ class WorldModelTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         losses = transition_world_model_loss(self.model, sampled, self.config)
         losses.total.backward()
-        self._finish_step()
+        if self.config.grad_clip_norm is not None:
+            nn.utils.clip_grad_norm_(
+                (parameter for parameter in self.model.parameters() if parameter.requires_grad),
+                self.config.grad_clip_norm,
+            )
+        self.optimizer.step()
+        self.model.update_target()
         return losses.detached()
 
     def train_epoch(
@@ -541,7 +558,13 @@ class WorldModelTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             losses = transition_world_model_loss(self.model, sampled, self.config)
             losses.total.backward()
-            self._finish_step()
+            if self.config.grad_clip_norm is not None:
+                nn.utils.clip_grad_norm_(
+                    (parameter for parameter in self.model.parameters() if parameter.requires_grad),
+                    self.config.grad_clip_norm,
+                )
+            self.optimizer.step()
+            self.model.update_target()
             metrics = losses.detached()
             if on_update is not None:
                 on_update(metrics)
@@ -581,15 +604,6 @@ class WorldModelTrainer:
                 for name, value in metrics.items():
                     totals[name] = totals.get(name, 0.0) + value * count
         return {name: value / num_transitions for name, value in totals.items()}
-
-    def _finish_step(self) -> None:
-        if self.config.grad_clip_norm is not None:
-            nn.utils.clip_grad_norm_(
-                (parameter for parameter in self.model.parameters() if parameter.requires_grad),
-                self.config.grad_clip_norm,
-            )
-        self.optimizer.step()
-        self.model.update_target()
 
     def fit(
         self,

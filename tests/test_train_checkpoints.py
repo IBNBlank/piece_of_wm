@@ -12,8 +12,8 @@ from unittest import mock
 import numpy as np
 import torch
 
-from trans_wm import train as trans_wm_train
-from trans_wm_le import train as trans_wm_le_train
+from dreamer_like import train as dreamer_like_train
+from tdmpc_like import train as tdmpc_like_train
 from utils import training_runtime
 from utils.replay_buffer import RolloutReplayBuffer
 
@@ -67,31 +67,31 @@ class TrainingCheckpointTest(unittest.TestCase):
             model = mock.Mock()
             model.to.return_value = model
             with (
-                mock.patch.object(trans_wm_le_train, "parse_args", return_value=args),
-                mock.patch.object(trans_wm_le_train, "configure_logging"),
-                mock.patch.object(trans_wm_le_train, "_validate_positive_args"),
-                mock.patch.object(trans_wm_le_train, "seed_everything"),
-                mock.patch.object(trans_wm_le_train, "_rollout_files", return_value=[]),
-                mock.patch.object(trans_wm_le_train, "_validate_dataset_metadata"),
+                mock.patch.object(tdmpc_like_train, "parse_args", return_value=args),
+                mock.patch.object(tdmpc_like_train, "configure_logging"),
+                mock.patch.object(tdmpc_like_train, "_validate_positive_args"),
+                mock.patch.object(tdmpc_like_train, "seed_everything"),
+                mock.patch.object(tdmpc_like_train, "_rollout_files", return_value=[]),
+                mock.patch.object(tdmpc_like_train, "_validate_dataset_metadata"),
                 mock.patch.object(
-                    trans_wm_le_train,
+                    tdmpc_like_train,
                     "OfflineRolloutDataset",
                     return_value=replay_buffer,
                 ),
-                mock.patch.object(trans_wm_le_train, "WorldModel", return_value=model),
-                mock.patch.object(trans_wm_le_train, "WorldModelTrainer", return_value=mock.Mock()),
-                mock.patch.object(trans_wm_le_train, "_write_config"),
-                mock.patch.object(trans_wm_le_train, "_run_pretraining") as run_pretraining,
-                mock.patch.object(trans_wm_le_train, "make_env") as make_env,
+                mock.patch.object(tdmpc_like_train, "WorldModel", return_value=model),
+                mock.patch.object(tdmpc_like_train, "WorldModelTrainer", return_value=mock.Mock()),
+                mock.patch.object(tdmpc_like_train, "_write_config"),
+                mock.patch.object(tdmpc_like_train, "_run_pretraining") as run_pretraining,
+                mock.patch.object(tdmpc_like_train, "make_env") as make_env,
             ):
-                trans_wm_le_train.main()
+                tdmpc_like_train.main()
 
             run_pretraining.assert_called_once()
             self.assertFalse(hasattr(run_pretraining.call_args.args[4], "value_weight"))
             make_env.assert_not_called()
 
     def test_training_cli_has_no_gamma_or_value_weight(self) -> None:
-        for module in (trans_wm_train, trans_wm_le_train):
+        for module in (dreamer_like_train, tdmpc_like_train):
             with self.subTest(module=module.__name__), mock.patch(
                 "sys.argv", ["train", "--data-dir", "dataset"]
             ):
@@ -100,7 +100,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertFalse(hasattr(args, "value_weight"))
 
     def test_training_particle_defaults(self) -> None:
-        for module in (trans_wm_train, trans_wm_le_train):
+        for module in (dreamer_like_train, tdmpc_like_train):
             with self.subTest(module=module.__name__), mock.patch(
                 "sys.argv", ["train", "--data-dir", "dataset"]
             ):
@@ -111,7 +111,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertEqual(args.planning_horizon, 20)
 
     def test_rolling_checkpoints_keep_latest_two_and_resolve_latest(self) -> None:
-        for module in (trans_wm_train, trans_wm_le_train):
+        for module in (dreamer_like_train, tdmpc_like_train):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 output_dir = Path(directory)
                 (output_dir / "checkpoint_best.pt").touch()
@@ -137,18 +137,18 @@ class TrainingCheckpointTest(unittest.TestCase):
     def test_checkpoint_restores_training_state_and_rngs(self) -> None:
         cases = (
             (
-                trans_wm_train,
-                trans_wm_train.WorldModelConfig(
+                dreamer_like_train,
+                dreamer_like_train.WorldModelConfig(
                     observation_shape=(3, 32, 32), action_shape=(1,), cnn_channels=(4,)
                 ),
-                trans_wm_train.TrainingConfig(),
+                dreamer_like_train.TrainingConfig(),
             ),
             (
-                trans_wm_le_train,
-                trans_wm_le_train.WorldModelConfig(
+                tdmpc_like_train,
+                tdmpc_like_train.WorldModelConfig(
                     observation_shape=(3, 32, 32), action_shape=(1,), cnn_channels=(4,)
                 ),
-                trans_wm_le_train.TrainingConfig(),
+                tdmpc_like_train.TrainingConfig(),
             ),
         )
         for module, model_config, training_config in cases:
@@ -237,18 +237,18 @@ class TrainingCheckpointTest(unittest.TestCase):
     def test_pretrained_checkpoint_loads_only_world_training_state(self) -> None:
         cases = (
             (
-                trans_wm_train,
-                trans_wm_train.WorldModelConfig(
+                dreamer_like_train,
+                dreamer_like_train.WorldModelConfig(
                     observation_shape=(3, 32, 32), action_shape=(1,), cnn_channels=(4,)
                 ),
-                trans_wm_train.TrainingConfig(),
+                dreamer_like_train.TrainingConfig(),
             ),
             (
-                trans_wm_le_train,
-                trans_wm_le_train.WorldModelConfig(
+                tdmpc_like_train,
+                tdmpc_like_train.WorldModelConfig(
                     observation_shape=(3, 32, 32), action_shape=(1,), cnn_channels=(4,)
                 ),
-                trans_wm_le_train.TrainingConfig(),
+                tdmpc_like_train.TrainingConfig(),
             ),
         )
         for module, model_config, training_config in cases:
@@ -289,7 +289,7 @@ class TrainingCheckpointTest(unittest.TestCase):
                 self.assertIsNone(trainer.optimizer.loaded)
 
     def test_pretraining_only_runs_replay_updates(self) -> None:
-        for module in (trans_wm_train, trans_wm_le_train):
+        for module in (dreamer_like_train, tdmpc_like_train):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 output_dir = Path(directory)
                 trainer = SimpleNamespace(train_epoch=mock.Mock(return_value={"total": 1.0}))
@@ -353,24 +353,24 @@ class TrainingCheckpointTest(unittest.TestCase):
     def test_formal_model_restores_complete_pretrained_world_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "checkpoint_best.pt"
-            source_config = trans_wm_le_train.WorldModelConfig(
+            source_config = tdmpc_like_train.WorldModelConfig(
                 observation_shape=(3, 32, 32),
                 action_shape=(1,),
                 cnn_channels=(4,),
             )
-            target_config = trans_wm_le_train._model_config_from_checkpoint(
+            target_config = tdmpc_like_train._model_config_from_checkpoint(
                 asdict(source_config),
                 source_config.observation_shape,
                 source_config.action_shape,
             )
-            pretraining_config = trans_wm_le_train.TrainingConfig()
-            source_model = trans_wm_le_train.WorldModel(source_config)
-            source_trainer = trans_wm_le_train.WorldModelTrainer(
+            pretraining_config = tdmpc_like_train.TrainingConfig()
+            source_model = tdmpc_like_train.WorldModel(source_config)
+            source_trainer = tdmpc_like_train.WorldModelTrainer(
                 source_model, pretraining_config
             )
             replay_buffer = RolloutReplayBuffer.__new__(RolloutReplayBuffer)
             replay_buffer._rng = np.random.default_rng(2)
-            trans_wm_le_train._save_checkpoint(
+            tdmpc_like_train._save_checkpoint(
                 path,
                 source_model,
                 source_trainer,
@@ -385,8 +385,8 @@ class TrainingCheckpointTest(unittest.TestCase):
                 phase="pretrain",
             )
 
-            target_model = trans_wm_le_train.WorldModel(target_config)
-            trans_wm_le_train._load_pretrained_checkpoint(
+            target_model = tdmpc_like_train.WorldModel(target_config)
+            tdmpc_like_train._load_pretrained_checkpoint(
                 path,
                 target_model,
                 target_config,

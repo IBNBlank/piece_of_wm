@@ -1,4 +1,4 @@
-"""Train Trans-WM from a directory of sequence-preserving rollout files."""
+"""Train TD-MPC-like from a directory of sequence-preserving rollout files."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from eval import run_online_episode
-from trans_wm import (
+from tdmpc_like import (
     TrainingConfig,
     WorldModel,
     WorldModelConfig,
@@ -33,24 +33,25 @@ from utils.particle_policy import ParticlePolicy
 from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutReplayBuffer
 
 
-LOGGER = logging.getLogger("piece_of_wm.trans_wm")
+LOGGER = logging.getLogger("piece_of_wm.tdmpc_like")
 _evaluate_validation = training_runtime.evaluate_validation
 _resolve_resume_checkpoint = training_runtime.resolve_resume_checkpoint
 _run_pretraining = partial(
     training_runtime.run_pretraining,
-    description="Pretraining Trans-WM",
+    description="Pretraining TD-MPC-like",
     logger=LOGGER,
 )
 _save_checkpoint = training_runtime.save_checkpoint
 _save_rolling_checkpoint = training_runtime.save_rolling_checkpoint
 _restore_checkpoint = training_runtime.restore_checkpoint
 _load_pretrained_checkpoint = training_runtime.load_pretrained_checkpoint
+_read_pretrained_checkpoint = training_runtime.read_pretrained_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("runs/trans_wm"))
+    parser.add_argument("--output-dir", type=Path, default=Path("runs/tdmpc_like"))
     parser.add_argument("--num-envs", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--rollouts", type=int, default=100, help="Number of rollouts to train.")
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         help="Rollout files held in RAM; defaults to the complete dataset.",
     )
     parser.add_argument("--sample-rollouts", type=int, default=2)
-    parser.add_argument("--env-id", default="Pendulum-v1")
+    parser.add_argument("--env-id", default="FetchPickAndPlace-v4")
     parser.add_argument("--num-particles", type=int, default=1000)
     parser.add_argument("--particle-updates", type=int, default=5)
     parser.add_argument("--particle-sigma", type=float, default=0.1)
@@ -84,32 +85,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--pretrained-checkpoint", type=Path, default=None)
     parser.add_argument("--pretrain", action="store_true", help="Train only the world model.")
-    parser.add_argument("--observation-dim", type=int, default=128)
-    parser.add_argument("--model-dim", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=3)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--feedforward-dim", type=int, default=512)
-    parser.add_argument("--cnn-channels", default="32,64,128")
-    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--target-ema", type=float, default=0.99)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
-    parser.add_argument("--vae-reconstruction-weight", type=float, default=1.0)
-    parser.add_argument("--vae-kl-weight", type=float, default=1e-4)
+    parser.add_argument("--jepa-weight", type=float, default=1.0)
+    parser.add_argument("--sigreg-weight", type=float, default=0.2)
+    parser.add_argument("--sigreg-projections", type=int, default=256)
+    parser.add_argument("--sigreg-frequencies", type=int, default=17)
+    parser.add_argument("--sigreg-max-frequency", type=float, default=5.0)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.env_id != "FetchPickAndPlace-v4":
+        raise ValueError("This project supports only FetchPickAndPlace-v4.")
     configure_logging(args.verbose)
     _validate_positive_args(args)
     seed_everything(args.seed)
     rng = np.random.default_rng(args.seed)
-    device = torch.device(
-        args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(args.device if args.device is not None else default_device)
     rollout_files = _rollout_files(args.data_dir)
     _validate_dataset_metadata(args.data_dir, args.num_envs, args.max_steps)
     if args.pretrain:
@@ -126,24 +124,29 @@ def main() -> None:
     first_batch = replay_buffer.sample(1)
     observation_shape, action_shape = _model_shapes(first_batch)
     del first_batch
-    model_config = WorldModelConfig(
-        observation_shape=observation_shape,
-        action_shape=action_shape,
-        observation_dim=args.observation_dim,
-        model_dim=args.model_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        feedforward_dim=args.feedforward_dim,
-        cnn_channels=_parse_channels(args.cnn_channels),
-        dropout=args.dropout,
-        target_ema=args.target_ema,
-    )
+    pretrained_checkpoint = None
+    if args.pretrained_checkpoint is not None:
+        pretrained_checkpoint = _read_pretrained_checkpoint(
+            args.pretrained_checkpoint, device
+        )
+        model_config = _model_config_from_checkpoint(
+            pretrained_checkpoint["model_config"], observation_shape, action_shape
+        )
+    else:
+        model_config = WorldModelConfig(
+            observation_shape=observation_shape,
+            action_shape=action_shape,
+            target_ema=args.target_ema,
+        )
     training_config = TrainingConfig(
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         grad_clip_norm=args.grad_clip_norm,
-        vae_reconstruction_weight=args.vae_reconstruction_weight,
-        vae_kl_weight=args.vae_kl_weight,
+        jepa_weight=args.jepa_weight,
+        sigreg_weight=args.sigreg_weight,
+        sigreg_projections=args.sigreg_projections,
+        sigreg_frequencies=args.sigreg_frequencies,
+        sigreg_max_frequency=args.sigreg_max_frequency,
         planning_horizon=args.planning_horizon,
     )
     model = WorldModel(model_config).to(device)
@@ -168,6 +171,7 @@ def main() -> None:
             model,
             model_config,
             device,
+            checkpoint=pretrained_checkpoint,
         )
         LOGGER.info("Initialized world model from %s.", args.pretrained_checkpoint)
     if args.pretrain:
@@ -187,10 +191,11 @@ def main() -> None:
         )
         return
 
-    policy = ParticlePolicy(
-        num_particles=args.num_particles, horizon=args.planning_horizon
-    )
     eval_env = make_env(args.env_id, render_mode="rgb_array")
+    policy = ParticlePolicy(
+        num_particles=args.num_particles,
+        horizon=args.planning_horizon,
+    )
     start_rollout = 0
     best_online_return = -float("inf")
     if args.resume is not None:
@@ -225,7 +230,7 @@ def main() -> None:
         range(start_rollout + 1, args.rollouts + 1),
         total=args.rollouts,
         initial=start_rollout,
-        desc="Training Trans-WM",
+        desc="Training TD-MPC-like",
         unit="rollout",
         disable=not show_progress,
         dynamic_ncols=show_progress,
@@ -269,7 +274,7 @@ def main() -> None:
                 )
                 record.update({f"validation_{name}": value for name, value in validation.items()})
                 evaluation_return = _evaluate_policy(
-                    "trans_wm",
+                    "tdmpc_like",
                     model,
                     rollout_index,
                     eval_env,
@@ -340,7 +345,7 @@ def _load_rollout(path: Path) -> EpisodeBatch:
         images,
     )
     if batch.images is None:
-        raise ValueError(f"Rollout {path} has no images; Trans-WM requires image data.")
+        raise ValueError(f"Rollout {path} has no images; TD-MPC-like requires image data.")
     if batch.images.shape[:2] != batch.obs.shape[:2]:
         raise ValueError(f"Images in {path} are not aligned with observations.")
     return batch
@@ -379,14 +384,24 @@ def _model_shapes(batch: EpisodeBatch) -> tuple[tuple[int, int, int], tuple[int,
     return (channels, height, width), tuple(batch.action.shape[2:])
 
 
-def _parse_channels(value: str) -> tuple[int, ...]:
-    try:
-        channels = tuple(int(item.strip()) for item in value.split(",") if item.strip())
-    except ValueError as error:
-        raise ValueError("--cnn-channels must be comma-separated integers.") from error
-    if not channels or any(channel <= 0 for channel in channels):
-        raise ValueError("--cnn-channels must contain positive integers.")
-    return channels
+def _model_config_from_checkpoint(
+    payload: dict[str, object],
+    observation_shape: tuple[int, int, int],
+    action_shape: tuple[int, ...],
+) -> WorldModelConfig:
+    values = dict(payload)
+    checkpoint_observation_shape = tuple(values.pop("observation_shape"))
+    checkpoint_action_shape = tuple(values.pop("action_shape"))
+    if checkpoint_observation_shape != observation_shape:
+        raise ValueError("Pretrained observation shape does not match the dataset.")
+    if checkpoint_action_shape != action_shape:
+        raise ValueError("Pretrained action shape does not match the dataset.")
+    values["cnn_channels"] = tuple(values["cnn_channels"])
+    return WorldModelConfig(
+        observation_shape=observation_shape,
+        action_shape=action_shape,
+        **values,
+    )
 
 
 def _validate_positive_args(args: argparse.Namespace) -> None:

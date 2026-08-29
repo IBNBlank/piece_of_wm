@@ -1,4 +1,4 @@
-"""Tests for the variational latent world model, dynamics, heads, and losses."""
+"""Tests for the action-conditioned latent JEPA world model."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from unittest import mock
 import numpy as np
 import torch
 
-import trans_wm.training as training_module
+import tdmpc_like.training as training_module
 
-from trans_wm import (
+from tdmpc_like import (
     ACTION_HISTORY_LEN,
     OBS_HISTORY_LEN,
     TrainingConfig,
@@ -19,9 +19,10 @@ from trans_wm import (
     WorldModelTrainer,
     append_history,
     sample_transition_batch,
+    sigreg_loss,
     tensor_episode_batch,
+    transition_world_model_loss,
     world_model_loss,
-    vae_kl_loss,
 )
 from utils.replay_buffer import EpisodeBatch
 
@@ -37,6 +38,14 @@ def _config() -> WorldModelConfig:
         feedforward_dim=32,
         cnn_channels=(8, 16),
         dropout=0.0,
+    )
+
+
+def _training_config() -> TrainingConfig:
+    return TrainingConfig(
+        grad_clip_norm=10.0,
+        sigreg_projections=8,
+        sigreg_frequencies=4,
     )
 
 
@@ -61,34 +70,25 @@ class WorldModelShapeTest(unittest.TestCase):
         torch.manual_seed(3)
         self.model = WorldModel(_config()).eval()
 
-    def test_encoder_and_action_history_produce_128d_z(self) -> None:
+    def test_cnn_output_is_observation_and_obs_plus_ah_produces_128d_latent(self) -> None:
         images = torch.randn(4, OBS_HISTORY_LEN, 3, 32, 32)
-        mask = torch.ones(4, OBS_HISTORY_LEN, dtype=torch.bool)
-        actions = torch.randn(4, ACTION_HISTORY_LEN, 2)
+        obs_mask = torch.ones(4, OBS_HISTORY_LEN, dtype=torch.bool)
+        action_history = torch.randn(4, ACTION_HISTORY_LEN, 2)
         action_mask = torch.ones(4, ACTION_HISTORY_LEN, dtype=torch.bool)
 
-        observation = self.model.encode_observation_online(images, mask)
-        z = self.model.encode(images, mask, actions, action_mask)
+        observation = self.model.encode_observation_online(images, obs_mask)
+        latent = self.model.encode(images, obs_mask, action_history, action_mask)
 
         self.assertEqual(observation.shape, (4, 12))
-        self.assertEqual(z.shape, (4, 128))
-        first_conv = self.model.encoder.cnn[0]
-        self.assertEqual(first_conv.in_channels, OBS_HISTORY_LEN * 3)
-
-    def test_encoder_ignores_masked_image_values(self) -> None:
-        images = torch.randn(2, OBS_HISTORY_LEN, 3, 32, 32)
-        mask = torch.tensor([[False, True, True], [True] * OBS_HISTORY_LEN])
-        actions = torch.randn(2, ACTION_HISTORY_LEN, 2)
-        changed = images.clone()
-        changed[~mask] = 10000.0
-
-        torch.testing.assert_close(
-            self.model.encode(images, mask, actions),
-            self.model.encode(changed, mask, actions),
+        self.assertEqual(latent.shape, (4, 128))
+        changed = action_history.clone()
+        changed[:, -1] += 1.0
+        self.assertFalse(
+            torch.equal(latent, self.model.encode(images, obs_mask, changed, action_mask))
         )
 
     def test_dynamics_uses_latent_and_current_action_tokens(self) -> None:
-        z = torch.randn(4, 128)
+        latent = torch.randn(4, 128)
         action = torch.randn(4, 2)
         captured: list[torch.Size] = []
 
@@ -96,70 +96,41 @@ class WorldModelShapeTest(unittest.TestCase):
             lambda _module, inputs: captured.append(inputs[0].shape)
         )
         try:
-            next_z = self.model.predict_next_online(z, action)
+            next_latent = self.model.predict_next_online(latent, action)
         finally:
             handle.remove()
 
-        self.assertEqual(next_z.shape, (4, 128))
+        self.assertEqual(next_latent.shape, (4, 128))
         self.assertEqual(captured, [torch.Size((4, 2, 16))])
 
-    def test_action_history_is_one_flattened_ah_tensor(self) -> None:
-        actions = torch.randn(2, ACTION_HISTORY_LEN, 2)
-        mask = torch.tensor([[False, True], [True] * ACTION_HISTORY_LEN])
+    def test_decoder_and_observation_head_are_absent(self) -> None:
+        heads = self.model.predict_heads(torch.randn(3, 128), torch.randn(3, 2))
 
-        ah = self.model.action_history_tensor(actions, mask)
-
-        self.assertEqual(ah.shape, (2, ACTION_HISTORY_LEN * 2))
-        self.assertTrue(torch.equal(ah[0, :2], torch.zeros(2)))
-        torch.testing.assert_close(ah[0, -2:], actions[0, -1].flatten())
-        images = torch.randn(2, OBS_HISTORY_LEN, 3, 32, 32)
-        image_mask = torch.ones(2, OBS_HISTORY_LEN, dtype=torch.bool)
-        torch.testing.assert_close(
-            self.model.encode_online(images, image_mask, actions, mask),
-            self.model.encode_online(images, image_mask, ah),
-        )
-
-    def test_heads_read_one_z_and_reconstruct_image_history(self) -> None:
-        output = self.model.predict_heads(torch.randn(3, 128), torch.randn(3, 2))
-
-        self.assertEqual(output.observation.shape, (3, OBS_HISTORY_LEN, 3, 32, 32))
-        self.assertEqual(output.reward.shape, (3, 1))
-        self.assertFalse(hasattr(output, "value"))
+        self.assertEqual(heads.reward.shape, (3, 1))
+        self.assertFalse(hasattr(heads, "value"))
+        self.assertFalse(hasattr(heads, "observation"))
+        self.assertFalse(hasattr(self.model.heads, "observation_head"))
         self.assertFalse(hasattr(self.model.heads, "value_head"))
 
-    def test_action_score_is_predicted_reward(self) -> None:
-        z = torch.randn(2, 128)
-        action = torch.randn(2, 2)
-
-        result = self.model.evaluate_action(z, action)
-
-        torch.testing.assert_close(result.score, result.heads.reward)
-        self.assertEqual(result.score.shape, (2, 1))
-
-    def test_rollout_maintains_only_action_history(self) -> None:
-        z = torch.randn(2, 128)
+    def test_rollout_updates_history_but_dynamics_only_receives_action(self) -> None:
+        latent = torch.randn(2, 128)
         action_history = torch.randn(2, ACTION_HISTORY_LEN, 2)
         action_mask = torch.tensor([[False, True], [True] * ACTION_HISTORY_LEN])
         actions = torch.randn(2, 3, 2)
 
-        output = self.model.rollout(z, action_history, actions, action_mask)
+        output = self.model.rollout(latent, action_history, actions, action_mask)
 
         self.assertEqual(output.latents.shape, (2, 3, 128))
-        self.assertEqual(
-            output.observations.shape, (2, 3, OBS_HISTORY_LEN, 3, 32, 32)
-        )
         self.assertEqual(output.rewards.shape, (2, 3, 1))
         self.assertFalse(hasattr(output, "values"))
-        self.assertEqual(output.scores.shape, (2, 3, 1))
         torch.testing.assert_close(output.scores, output.rewards)
-        self.assertEqual(output.final_z.shape, (2, 128))
         self.assertEqual(output.final_action_history.shape, (2, ACTION_HISTORY_LEN, 2))
         torch.testing.assert_close(output.final_action_history, actions[:, -2:])
 
 
 class WorldModelTrainingTest(unittest.TestCase):
     def test_validation_epoch_visits_every_transition_once(self) -> None:
-        trainer = WorldModelTrainer(WorldModel(_config()), TrainingConfig())
+        trainer = WorldModelTrainer(WorldModel(_config()), _training_config())
         batch = _batch()
         with mock.patch.object(
             training_module,
@@ -176,7 +147,7 @@ class WorldModelTrainingTest(unittest.TestCase):
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 
     def test_epoch_visits_every_transition_once_and_keeps_partial_batch(self) -> None:
-        trainer = WorldModelTrainer(WorldModel(_config()), TrainingConfig())
+        trainer = WorldModelTrainer(WorldModel(_config()), _training_config())
         batches = [_batch(), _batch()]
         on_update = mock.Mock()
         with (
@@ -220,13 +191,14 @@ class WorldModelTrainingTest(unittest.TestCase):
         )
 
     def test_transition_sampler_preserves_frame_history_alignment(self) -> None:
-        model = WorldModel(_config())
         sampled = sample_transition_batch(
-            _batch(), model, batch_size=6, rng=np.random.default_rng(4), planning_horizon=10
+            _batch(),
+            WorldModel(_config()),
+            batch_size=6,
+            rng=np.random.default_rng(4),
+            planning_horizon=10,
         )
 
-        self.assertEqual(sampled.current_observations.shape, (6, 3, 3, 32, 32))
-        self.assertEqual(sampled.action_history.shape, (6, 2, 2))
         torch.testing.assert_close(
             sampled.current_observations[:, 1:], sampled.next_observations[:, :-1]
         )
@@ -253,7 +225,7 @@ class WorldModelTrainingTest(unittest.TestCase):
 
     def test_transition_loss_recursively_predicts_each_horizon_step(self) -> None:
         model = WorldModel(_config())
-        config = TrainingConfig(planning_horizon=3)
+        config = _training_config()
         sampled = training_module.transition_batch_from_indices(
             _batch(), model, np.asarray([2]), planning_horizon=3
         )
@@ -261,104 +233,87 @@ class WorldModelTrainingTest(unittest.TestCase):
         with mock.patch.object(
             model, "predict_next_online", wraps=model.predict_next_online
         ) as predict_next:
-            training_module.transition_world_model_loss(model, sampled, config)
+            transition_world_model_loss(model, sampled, config)
 
         self.assertEqual(predict_next.call_count, 3)
 
-    def test_multistep_vae_uses_each_aligned_state_posterior(self) -> None:
+    def test_jepa_target_uses_action_history_with_current_action_appended(self) -> None:
         model = WorldModel(_config())
-        sampled = training_module.transition_batch_from_indices(
-            _batch(), model, np.asarray([2]), planning_horizon=3
+        sampled = sample_transition_batch(
+            _batch(),
+            model,
+            batch_size=3,
+            rng=np.random.default_rng(2),
+            planning_horizon=10,
         )
-        with mock.patch.object(
-            model, "posterior_online", wraps=model.posterior_online
-        ) as posterior:
-            training_module.transition_world_model_loss(
-                model, sampled, TrainingConfig(planning_horizon=3)
-            )
-
-        self.assertEqual(posterior.call_count, 4)
-        next_history, next_valid = append_history(
+        captured: list[torch.Tensor] = []
+        handle = model.ema_latent_encoder.register_forward_pre_hook(
+            lambda _module, inputs: captured.append(inputs[1].detach().clone())
+        )
+        try:
+            transition_world_model_loss(model, sampled, _training_config())
+        finally:
+            handle.remove()
+        next_history, next_mask = append_history(
             sampled.action_history, sampled.action_valid, sampled.action
         )
-        torch.testing.assert_close(posterior.call_args_list[1].args[2], next_history)
-        torch.testing.assert_close(posterior.call_args_list[1].args[3], next_valid)
 
-    def test_vae_kl_is_zero_for_standard_normal_posterior(self) -> None:
-        mean = torch.zeros(2, 8)
-        log_variance = torch.zeros(2, 8)
+        self.assertEqual(len(captured), 10)
+        torch.testing.assert_close(
+            captured[0], model.action_history_tensor(next_history, next_mask)
+        )
 
-        loss = vae_kl_loss(mean, log_variance)
+    def test_sigreg_is_finite_and_backpropagates(self) -> None:
+        latents = torch.randn(16, 128, requires_grad=True)
 
-        torch.testing.assert_close(loss, torch.zeros(2))
+        loss = sigreg_loss(latents, num_projections=8, num_frequencies=4)
+        loss.backward()
 
-    def test_image_batch_conversion_and_training_losses(self) -> None:
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(latents.grad)
+        self.assertTrue(torch.isfinite(latents.grad).all())
+
+    def test_full_and_sampled_training_have_new_losses_and_gradients(self) -> None:
         torch.manual_seed(8)
         model = WorldModel(_config())
-        config = TrainingConfig(grad_clip_norm=10.0)
+        config = _training_config()
         batch = _batch()
-        tensor_batch = tensor_episode_batch(batch, model)
+        losses = world_model_loss(model, tensor_episode_batch(batch, model), config)
 
-        self.assertEqual(tensor_batch.observations.shape, (2, 5, 3, 32, 32))
-        self.assertGreaterEqual(tensor_batch.observations.min().item(), 0.0)
-        self.assertLessEqual(tensor_batch.observations.max().item(), 1.0)
-        losses = world_model_loss(model, tensor_batch, config)
-        self.assertTrue(torch.isfinite(losses.total))
         losses.total.backward()
+
         self.assertIsNotNone(model.encoder.to_observation[1].weight.grad)
-        self.assertIsNotNone(model.latent_encoder.to_statistics[0].weight.grad)
-        self.assertIsNotNone(model.dynamics.output[1].weight.grad)
+        self.assertIsNotNone(model.latent_encoder.mlp[0].weight.grad)
+        self.assertIsNotNone(model.dynamics.output[-1].weight.grad)
         model.zero_grad(set_to_none=True)
-
-        metrics = WorldModelTrainer(model, config).train_batch(batch)
-
-        self.assertEqual(
-            set(metrics),
-            {"total", "observation", "reward", "vae_reconstruction", "vae_kl"},
-        )
-        self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
-
-        sampled_metrics = WorldModelTrainer(model, config).train_transitions(
+        trainer = WorldModelTrainer(model, config)
+        full_metrics = trainer.train_batch(batch)
+        sampled_metrics = trainer.train_transitions(
             batch, batch_size=3, rng=np.random.default_rng(5)
         )
+        expected_metrics = {"total", "jepa", "sigreg", "reward"}
+        self.assertEqual(set(full_metrics), expected_metrics)
+        self.assertEqual(set(sampled_metrics), expected_metrics)
+        self.assertTrue(all(np.isfinite(value) for value in full_metrics.values()))
         self.assertTrue(all(np.isfinite(value) for value in sampled_metrics.values()))
 
-    def test_policy_facing_apis_use_frozen_ema_modules_without_grad(self) -> None:
+    def test_policy_apis_and_all_ema_modules_are_frozen(self) -> None:
         model = WorldModel(_config())
-        image = torch.randn(2, OBS_HISTORY_LEN, 3, 32, 32)
+        images = torch.randn(2, OBS_HISTORY_LEN, 3, 32, 32)
         image_mask = torch.ones(2, OBS_HISTORY_LEN, dtype=torch.bool)
         action_history = torch.randn(2, ACTION_HISTORY_LEN, 2)
-        z = model.encode_ema(image, image_mask, action_history)
-        action = torch.randn(2, 2)
-
-        evaluation = model.evaluate_action(z, action)
+        action_mask = torch.ones(2, ACTION_HISTORY_LEN, dtype=torch.bool)
+        latent = model.encode(images, image_mask, action_history, action_mask)
+        evaluation = model.evaluate_action(latent, torch.randn(2, 2))
 
         self.assertFalse(evaluation.next_z.requires_grad)
-        self.assertTrue(all(not parameter.requires_grad for parameter in model.ema_encoder.parameters()))
-        self.assertTrue(all(not parameter.requires_grad for parameter in model.ema_latent_encoder.parameters()))
-        self.assertTrue(all(not parameter.requires_grad for parameter in model.ema_dynamics.parameters()))
-        self.assertTrue(all(not parameter.requires_grad for parameter in model.ema_heads.parameters()))
-
-    def test_ema_update_covers_encoder_dynamics_and_heads(self) -> None:
-        model = WorldModel(_config())
-        with torch.no_grad():
-            next(model.encoder.parameters()).add_(1.0)
-            next(model.latent_encoder.parameters()).add_(1.0)
-            next(model.dynamics.parameters()).add_(1.0)
-            next(model.heads.parameters()).add_(1.0)
-
-        model.update_target(ema=0.0)
-
-        for ema_module, online_module in (
-            (model.ema_encoder, model.encoder),
-            (model.ema_latent_encoder, model.latent_encoder),
-            (model.ema_dynamics, model.dynamics),
-            (model.ema_heads, model.heads),
+        for module in (
+            model.ema_encoder,
+            model.ema_latent_encoder,
+            model.ema_dynamics,
+            model.ema_heads,
         ):
-            for ema_parameter, online_parameter in zip(
-                ema_module.parameters(), online_module.parameters(), strict=True
-            ):
-                torch.testing.assert_close(ema_parameter, online_parameter)
+            self.assertTrue(all(not parameter.requires_grad for parameter in module.parameters()))
 
 
 if __name__ == "__main__":

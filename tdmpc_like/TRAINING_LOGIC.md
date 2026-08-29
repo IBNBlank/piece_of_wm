@@ -1,6 +1,6 @@
-# Trans-WM-LE Training Logic
+# TD-MPC-like Training Logic
 
-本文说明 `trans_wm_le` 当前训练入口 `python -m trans_wm_le.train` 的实际执行逻辑。它使用 replay 训练 world model，并在真实环境中只做周期性评估。
+本文说明 `tdmpc_like` 当前训练入口 `python -m tdmpc_like.train` 的实际执行逻辑。它使用 replay 训练 world model，并在真实环境中只做周期性评估。
 
 ## 总览
 
@@ -35,7 +35,7 @@ flowchart TD
 
 ## 预训练阶段
 
-`run_pretrain_trans_wm_le.sh` 通过 `--pretrain` 进入纯 world-model 阶段。该阶段直接从 `DATA_DIR` 将源 rollout 加载到 RAM，不会在输出目录复制 replay 文件；随后按 epoch 打乱全部离线 transition，并以无放回 minibatch 完整遍历一次数据。它不会创建 Gym 环境或执行 particle policy。
+`run_pretrain_tdmpc_like.sh` 通过 `--pretrain` 进入纯 world-model 阶段。该阶段直接从 `DATA_DIR` 将源 rollout 加载到 RAM，不会在输出目录复制 replay 文件；随后按 epoch 打乱全部离线 transition，并以无放回 minibatch 完整遍历一次数据。它不会创建 Gym 环境或执行 particle policy。
 
 预训练使用固定 validation batch 的 `total` loss 选择 `checkpoint_best.pt`，并保留最近两个带 epoch 编号的 checkpoint。`RESUME` 用于恢复同一预训练阶段的完整 optimizer、epoch 计数器和 RNG 状态；正式训练则通过 `PRETRAINED_CHECKPOINT` 只加载预训练模型参数，并使用新的 optimizer、rollout 计数、best return 和 RNG 状态。预训练 checkpoint 与正式训练 checkpoint 分别标记为 `phase=pretrain` 和 `phase=training`，不能混用 `RESUME`。
 

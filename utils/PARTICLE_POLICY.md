@@ -1,12 +1,11 @@
 # 粒子策略
 
-`utils.particle_policy.ParticlePolicy` 只负责 `Pendulum-v1` 动作粒子的生成和更新，
+`utils.particle_policy.ParticlePolicy` 负责 Fetch pick-and-place 动作粒子的生成和更新，
 不包含 encoder、transition 或 reward 模型。世界模型代码负责预测每个粒子的
 分数，策略只用这些分数执行重采样与扰动。
 
-`init_particles(batch_size, ...)` 返回形状 `(B, 1000, H, 1)` 的高斯动作序列。每个时间步独立使用动作范围中心
-`(min + max) / 2` 作为均值、`(max - min) / 4` 作为标准差，采样后裁剪到合法范围。Pendulum-v1 对应
-`Normal(0, 1)` 并裁剪到 `[-2, 2]`。`update_particles(particles, scores, sigma=...)` 接收相同批次的
+`init_particles(batch_size, ...)` 返回形状 `(B, 1000, H, 4)` 的 Fetch 动作序列。每个时间步独立使用动作范围中心
+`(min + max) / 2` 作为均值、`(max - min) / 4` 作为标准差，采样后裁剪到合法范围 `[-1, 1]`。`update_particles(particles, scores, sigma=...)` 接收相同批次的
 粒子和形状 `(B, 1000)` 的分数，通过 `softmax(scores / temperature)` 形成重采样权重，再为每个重采样
 粒子加入高斯噪声。`temperature` 必须为正，默认是 `2.0`；较小的值增强选择压力，较大的值让重采样更均匀。
 

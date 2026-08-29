@@ -1,6 +1,6 @@
-# Trans-WM-LE：图像历史 JEPA Transformer 世界模型
+# TD-MPC-like：图像历史 JEPA Transformer 世界模型
 
-`trans_wm_le` 实现一个与 policy 完全解耦的 action-conditioned latent JEPA world model。模型不包含图像 decoder、VAE、生成式 dynamics、RSSM prior/posterior、actor、CEM 或 MPC。
+`tdmpc_like` 实现一个与 policy 完全解耦的 action-conditioned latent JEPA world model。模型不包含图像 decoder、VAE、生成式 dynamics、RSSM prior/posterior、actor、CEM 或 MPC。
 
 训练循环的完整执行顺序、数据对齐和参数更新范围见 [TRAINING_LOGIC.md](TRAINING_LOGIC.md)。
 
@@ -149,7 +149,7 @@ z_t = Linear(
 z_t: [B, 128]
 ```
 
-`latent_dim` 在 `trans_wm_le` 中固定为 128，配置为其他值会直接报错。`observation_dim` 与 `model_dim` 仍可配置。
+`latent_dim` 在 `tdmpc_like` 中固定为 128，配置为其他值会直接报错。`observation_dim` 与 `model_dim` 仍可配置。
 
 模型只维护当前一个 latent，不维护 latent history。
 
@@ -388,7 +388,7 @@ rollout = model.rollout(z_t, action_history, external_actions, action_valid_mask
 ## API 示例
 
 ```python
-from trans_wm_le import (
+from tdmpc_like import (
     TrainingConfig,
     WorldModel,
     WorldModelConfig,
@@ -400,7 +400,7 @@ model = WorldModel(
         observation_shape=(3, 128, 128),  # C, H, W
         action_shape=(7,),
         observation_dim=128,
-        latent_dim=128,  # trans_wm_le 中固定为 128
+        latent_dim=128,  # tdmpc_like 中固定为 128
         model_dim=256,
         num_layers=3,
         num_heads=4,
@@ -456,11 +456,11 @@ rollout = model.rollout(
 
 ```bash
 DEVICE=cuda PRETRAIN_EPOCHS=100 TRAIN_ROLLOUTS=500 \
-./run_integrate_trans_wm_le.sh
+./run_integrate_tdmpc_like.sh
 ```
 
 ```bash
-./run_train_trans_wm_le.sh
+./run_train_tdmpc_like.sh
 
 ROLLOUTS=500 \
 BATCH_SIZE=16 \
@@ -468,15 +468,15 @@ DEVICE=cuda \
 JEPA_WEIGHT=1.0 \
 SIGREG_WEIGHT=0.2 \
 VALUE_WEIGHT=1.0 \
-./run_train_trans_wm_le.sh
+./run_train_tdmpc_like.sh
 ```
 
 也可以直接调用 Python 训练入口：
 
 ```bash
-python -m trans_wm_le.train \
+python -m tdmpc_like.train \
     --data-dir dataset \
-    --output-dir runs/trans_wm_le \
+    --output-dir runs/tdmpc_like \
     --jepa-weight 1.0 \
     --sigreg-weight 0.2 \
     --value-weight 1.0

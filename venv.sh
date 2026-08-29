@@ -25,6 +25,6 @@ source .venv/bin/activate
 
 # Install dependencies
 uv pip install --upgrade torch --index-url https://mirrors.aliyun.com/pypi/simple/
-uv pip install numpy Pillow tqdm "gymnasium[classic-control]==1.3.0"
+uv pip install numpy Pillow tqdm "gymnasium[classic-control]==1.3.0" "gymnasium-robotics[mujoco]"
 
 cd $CUR_DIR

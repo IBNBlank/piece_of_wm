@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 from utils.common import configure_logging, seed_everything
 from utils.data import ROLLOUT_FILE_TEMPLATE, save_dataset_metadata, save_episode_batch
-from utils.env import make_env, reset_env
+from utils.env import make_env, observation_to_array, reset_env
 from utils.replay_buffer import EpisodeBatch
 
 
@@ -62,7 +62,7 @@ def _collect_random_rollout(
                 continue
             action = np.asarray(env.action_space.sample(), dtype=np.float32)
             next_obs, reward, terminated, truncated, _ = env.step(action)
-            next_obs = np.asarray(next_obs, dtype=np.float32)
+            next_obs = observation_to_array(next_obs)
             action_sequences[env_index].append(action)
             reward_sequences[env_index].append(float(reward))
             terminated_sequences[env_index].append(terminated)
@@ -127,12 +127,12 @@ def iter_random_rollouts(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env-id", default="Pendulum-v1")
+    parser.add_argument("--env-id", default="FetchPickAndPlace-v4")
     parser.add_argument("--rollouts", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--num-envs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/pendulum-random"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/fetch-pick-and-place-random"))
     parser.add_argument("--no-images", dest="collect_images", action="store_false")
     parser.set_defaults(collect_images=True)
     parser.add_argument("--verbose", action="store_true")

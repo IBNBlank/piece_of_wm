@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import torch
 
 from eval import _particle_sigma, score_particles, select_particle_action
-from trans_wm import WorldModel as TransWorldModel
-from trans_wm import WorldModelConfig as TransWorldModelConfig
-from trans_wm_le import WorldModel as LatentWorldModel
-from trans_wm_le import WorldModelConfig as LatentWorldModelConfig
+from dreamer_like import WorldModel as DreamerWorldModel
+from dreamer_like import WorldModelConfig as DreamerWorldModelConfig
+from tdmpc_like import WorldModel as LatentWorldModel
+from tdmpc_like import WorldModelConfig as LatentWorldModelConfig
 from utils.particle_policy import ParticlePolicy
 
 
@@ -22,9 +22,9 @@ class OnlineEvaluationTest(unittest.TestCase):
             1, 100, 1, 1
         ).expand(2, -1, -1, -1)
 
-    def test_trans_wm_scores_particle_actions_with_predicted_reward(self) -> None:
-        model = TransWorldModel(
-            TransWorldModelConfig(
+    def test_dreamer_like_scores_particle_actions_with_predicted_reward(self) -> None:
+        model = DreamerWorldModel(
+            DreamerWorldModelConfig(
                 observation_shape=(3, 32, 32),
                 action_shape=(1,),
                 model_dim=8,
@@ -46,7 +46,7 @@ class OnlineEvaluationTest(unittest.TestCase):
         self.assertEqual(rewards.shape, (2, 100))
         torch.testing.assert_close(scores, rewards)
 
-    def test_trans_wm_le_selects_a_bounded_particle_action(self) -> None:
+    def test_tdmpc_like_selects_a_bounded_particle_action(self) -> None:
         model = LatentWorldModel(
             LatentWorldModelConfig(
                 observation_shape=(3, 32, 32),

@@ -1,6 +1,6 @@
-# Trans-WM：图像历史 Transformer 世界模型
+# Dreamer-like：图像历史 Transformer 世界模型
 
-`trans_wm` 实现一个与 policy 完全解耦的图像 Transformer world model。当前结构不维护 latent history，也不包含生成式 dynamics、RSSM、actor、CEM 或 MPC。VAE posterior 由图像 observation representation 和前序 action history 共同生成。
+`dreamer_like` 实现一个与 policy 完全解耦的图像 Transformer world model。当前结构不维护 latent history，也不包含生成式 dynamics、RSSM、actor、CEM 或 MPC。VAE posterior 由图像 observation representation 和前序 action history 共同生成。
 
 模型只维护两个状态：
 
@@ -290,7 +290,7 @@ rollout = model.rollout(z_t, action_history, external_actions)
 ## API 示例
 
 ```python
-from trans_wm import WorldModel, WorldModelConfig, WorldModelTrainer
+from dreamer_like import WorldModel, WorldModelConfig, WorldModelTrainer
 
 model = WorldModel(
     WorldModelConfig(

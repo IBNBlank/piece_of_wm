@@ -1,8 +1,8 @@
-"""Trans-WM CNN/Transformer world model, independent of action-selection policy."""
+"""Action-conditioned latent JEPA world model."""
 
-from trans_wm.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN, WorldModelConfig
-from trans_wm.history import append_history, history_windows, previous_history_windows
-from trans_wm.model import (
+from tdmpc_like.config import ACTION_HISTORY_LEN, OBS_HISTORY_LEN, WorldModelConfig
+from tdmpc_like.history import append_history, history_windows, previous_history_windows
+from tdmpc_like.model import (
     ActionEvaluation,
     HeadOutput,
     ImageHistoryEncoder,
@@ -12,7 +12,7 @@ from trans_wm.model import (
     WorldHeads,
     WorldModel,
 )
-from trans_wm.training import (
+from tdmpc_like.training import (
     TensorEpisodeBatch,
     TensorTransitionBatch,
     TrainingConfig,
@@ -20,9 +20,9 @@ from trans_wm.training import (
     WorldModelTrainer,
     encode_sequence,
     sample_transition_batch,
+    sigreg_loss,
     tensor_episode_batch,
     transition_world_model_loss,
-    vae_kl_loss,
     world_model_loss,
 )
 
@@ -48,8 +48,8 @@ __all__ = [
     "history_windows",
     "previous_history_windows",
     "sample_transition_batch",
+    "sigreg_loss",
     "tensor_episode_batch",
     "transition_world_model_loss",
-    "vae_kl_loss",
     "world_model_loss",
 ]

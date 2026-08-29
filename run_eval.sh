@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 ###############################################################################
-# Online environment evaluation for Trans-WM and Trans-WM-LE policies.
+# Online environment evaluation for Dreamer-like and TD-MPC-like policies.
 #
 # Usage:
 #   ./run_eval.sh
-#   MODEL=trans_wm_le EPISODES=10 DEVICE=cuda ./run_eval.sh
+#   MODEL=tdmpc_like EPISODES=10 DEVICE=cuda ./run_eval.sh
 #
 # Tunables (env vars):
 #   PYTHON                  : Python interpreter
-#   MODEL                   : all, trans_wm, or trans_wm_le (default: all)
-#   ENV_ID                  : online Gymnasium environment (default: Pendulum-v1)
-#   TRANS_WM_CHECKPOINT     : Trans-WM checkpoint path
-#   TRANS_WM_LE_CHECKPOINT  : Trans-WM-LE checkpoint path
+#   MODEL                   : all, dreamer_like, or tdmpc_like (default: all)
+#   ENV_ID                  : online Gymnasium environment (default: FetchPickAndPlace-v4)
+#   DREAMER_LIKE_CHECKPOINT     : Dreamer-like checkpoint path
+#   TDMPC_LIKE_CHECKPOINT  : TD-MPC-like checkpoint path
 #   EPISODES                : online evaluation episodes (default: 5)
 #   MAX_STEPS               : maximum environment steps per episode (default: 200)
 #   NUM_PARTICLES           : action particles per policy update (default: 1000)
@@ -45,10 +45,10 @@ if [ ! -x "${PYTHON}" ]; then
 	exit 1
 fi
 
-MODEL="${MODEL:-trans_wm_le}"
-ENV_ID="${ENV_ID:-Pendulum-v1}"
-TRANS_WM_CHECKPOINT="${TRANS_WM_CHECKPOINT:-runs/trans_wm/checkpoint_best.pt}"
-TRANS_WM_LE_CHECKPOINT="${TRANS_WM_LE_CHECKPOINT:-runs/trans_wm_le/checkpoint_best.pt}"
+MODEL="${MODEL:-tdmpc_like}"
+ENV_ID="${ENV_ID:-FetchPickAndPlace-v4}"
+DREAMER_LIKE_CHECKPOINT="${DREAMER_LIKE_CHECKPOINT:-runs/dreamer_like/checkpoint_best.pt}"
+TDMPC_LIKE_CHECKPOINT="${TDMPC_LIKE_CHECKPOINT:-runs/tdmpc_like/checkpoint_best.pt}"
 EPISODES="${EPISODES:-5}"
 MAX_STEPS="${MAX_STEPS:-200}"
 PARTICLE_UPDATES="${PARTICLE_UPDATES:-5}"
@@ -68,8 +68,8 @@ export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 args=(
 	--model "${MODEL}"
 	--env-id "${ENV_ID}"
-	--trans-wm-checkpoint "${TRANS_WM_CHECKPOINT}"
-	--trans-wm-le-checkpoint "${TRANS_WM_LE_CHECKPOINT}"
+	--dreamer-like-checkpoint "${DREAMER_LIKE_CHECKPOINT}"
+	--tdmpc-like-checkpoint "${TDMPC_LIKE_CHECKPOINT}"
 	--episodes "${EPISODES}"
 	--max-steps "${MAX_STEPS}"
 	--particle-updates "${PARTICLE_UPDATES}"

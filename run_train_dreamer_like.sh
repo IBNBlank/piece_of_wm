@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 ###############################################################################
-# Train Trans-WM from sequence-preserving image rollouts.
+# Train Dreamer-like from sequence-preserving image rollouts.
 #
 # Usage:
-#   ./run_train_trans_wm.sh
-#   ROLLOUTS=500 BATCH_SIZE=16 DEVICE=cuda ./run_train_trans_wm.sh
+#   ./run_train_dreamer_like.sh
+#   ROLLOUTS=500 BATCH_SIZE=16 DEVICE=cuda ./run_train_dreamer_like.sh
 #
 # Tunables (env vars):
 #   PYTHON              : Python interpreter
-#   DATA_DIR            : rollout dataset directory (default: dataset/pendulum-random)
-#   OUTPUT_DIR          : checkpoints and metrics directory (default: runs/trans_wm)
+#   DATA_DIR            : rollout dataset directory (default: dataset/fetch-pick-and-place-random)
+#   OUTPUT_DIR          : checkpoints and metrics directory (default: runs/dreamer_like)
 #   NUM_ENVS            : environments per collected rollout (default: 10)
 #   MAX_STEPS           : maximum steps per environment episode (default: 200)
 #   ROLLOUTS            : number of rollout training units (default: 500)
@@ -41,7 +41,7 @@
 #   GRAD_CLIP_NORM       : gradient clipping norm (default: 10.0)
 #   VAE_RECONSTRUCTION_WEIGHT: VAE reconstruction loss weight (default: 1.0)
 #   VAE_KL_WEIGHT        : VAE KL loss weight (default: 1e-4)
-#   EXTRA_ARGS           : additional arguments forwarded to trans_wm.train
+#   EXTRA_ARGS           : additional arguments forwarded to dreamer_like.train
 ###############################################################################
 set -Eeuo pipefail
 
@@ -57,13 +57,13 @@ else
 fi
 
 if [ ! -x "${PYTHON}" ]; then
-	echo "[run_train_trans_wm] error: Python executable not found: ${PYTHON}" >&2
-	echo "[run_train_trans_wm] run ./venv.sh or set PYTHON=/path/to/python" >&2
+	echo "[run_train_dreamer_like] error: Python executable not found: ${PYTHON}" >&2
+	echo "[run_train_dreamer_like] run ./venv.sh or set PYTHON=/path/to/python" >&2
 	exit 1
 fi
 
-DATA_DIR="${DATA_DIR:-dataset/pendulum-random}"
-OUTPUT_DIR="${OUTPUT_DIR:-runs/trans_wm}"
+DATA_DIR="${DATA_DIR:-dataset/fetch-pick-and-place-random}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/dreamer_like}"
 NUM_ENVS="${NUM_ENVS:-10}"
 MAX_STEPS="${MAX_STEPS:-200}"
 ROLLOUTS="${ROLLOUTS:-500}"
@@ -98,7 +98,7 @@ VAE_KL_WEIGHT="${VAE_KL_WEIGHT:-1e-4}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [ -n "${RESUME}" ] && [ -n "${PRETRAINED_CHECKPOINT}" ]; then
-	echo "[run_train_trans_wm] error: RESUME and PRETRAINED_CHECKPOINT are mutually exclusive" >&2
+	echo "[run_train_dreamer_like] error: RESUME and PRETRAINED_CHECKPOINT are mutually exclusive" >&2
 	exit 1
 fi
 
@@ -148,9 +148,9 @@ if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
 	args+=(--pretrained-checkpoint "${PRETRAINED_CHECKPOINT}")
 fi
 
-echo "[run_train_trans_wm] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
-echo "[run_train_trans_wm] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
-echo "[run_train_trans_wm] observation_dim=${OBSERVATION_DIM} latent_dim=128 model_dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS}"
+echo "[run_train_dreamer_like] data_dir=${DATA_DIR} output_dir=${OUTPUT_DIR}"
+echo "[run_train_dreamer_like] rollouts=${ROLLOUTS} num_envs=${NUM_ENVS} max_steps=${MAX_STEPS} epochs_per_rollout=${EPOCHS_PER_ROLLOUT} batch_size=${BATCH_SIZE} sample_rollouts=${SAMPLE_ROLLOUTS} evaluation_rollouts=${EVALUATION_ROLLOUTS} particles=${NUM_PARTICLES} horizon=${PLANNING_HORIZON} temperature=${PARTICLE_TEMPERATURE} replay_capacity=${REPLAY_CAPACITY:-all} device=${DEVICE:-auto} seed=${SEED}"
+echo "[run_train_dreamer_like] observation_dim=${OBSERVATION_DIM} latent_dim=128 model_dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS}"
 
 # shellcheck disable=SC2086
-"${PYTHON}" -m trans_wm.train "${args[@]}" ${EXTRA_ARGS} "$@"
+"${PYTHON}" -m dreamer_like.train "${args[@]}" ${EXTRA_ARGS} "$@"

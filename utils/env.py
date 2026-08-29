@@ -6,8 +6,23 @@ import gymnasium as gym
 import numpy as np
 
 
+def observation_to_array(observation: object) -> np.ndarray:
+    """Convert Gym observations (including robotics dicts) to a stable vector."""
+    if isinstance(observation, dict):
+        parts = [observation_to_array(observation[key]).reshape(-1) for key in sorted(observation)]
+        return np.concatenate(parts).astype(np.float32, copy=False)
+    return np.asarray(observation, dtype=np.float32).reshape(-1)
+
+
 def make_env(env_id: str, *, render_mode: str | None = None) -> gym.Env:
     """Creates an environment with continuous actions for collection."""
+    if env_id == "FetchPickAndPlace-v4":
+        try:
+            import gymnasium_robotics  # noqa: F401  # registers robotics environments
+        except ImportError as error:
+            raise ImportError(
+                "Robotics environments require gymnasium-robotics[mujoco]; run ./venv.sh."
+            ) from error
     env = gym.make(env_id, render_mode=render_mode)
     if not isinstance(env.action_space, gym.spaces.Box):
         env.close()
@@ -21,4 +36,4 @@ def make_env(env_id: str, *, render_mode: str | None = None) -> gym.Env:
 def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
     """Resets an environment and normalizes observations to float32 arrays."""
     obs, _ = env.reset(seed=seed)
-    return np.asarray(obs, dtype=np.float32)
+    return observation_to_array(obs)

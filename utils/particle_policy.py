@@ -1,15 +1,13 @@
-"""Particle resampling primitives for Pendulum-v1 action selection."""
+"""Particle resampling primitives for bounded continuous Gym actions."""
 
 from __future__ import annotations
 
 import torch
 
 
-PENDULUM_ACTION_DIM = 1
-PENDULUM_ACTION_LOW = -2.0
-PENDULUM_ACTION_HIGH = 2.0
-PENDULUM_ACTION_MIDPOINT = (PENDULUM_ACTION_LOW + PENDULUM_ACTION_HIGH) / 2.0
-INITIAL_PARTICLE_SIGMA = (PENDULUM_ACTION_HIGH - PENDULUM_ACTION_LOW) / 4.0
+FETCH_ACTION_DIM = 4
+FETCH_ACTION_LOW = -1.0
+FETCH_ACTION_HIGH = 1.0
 NUM_ACTION_PARTICLES = 1000
 DEFAULT_PARTICLE_SIGMA = 0.1
 DEFAULT_PARTICLE_TEMPERATURE = 2.0
@@ -17,7 +15,7 @@ DEFAULT_PLANNING_HORIZON = 20
 
 
 class ParticlePolicy:
-    """Generates and updates batches of one-dimensional Pendulum action particles.
+    """Generates and updates batches of Fetch pick-and-place action particles.
 
     The policy has no world-model dependency. Callers evaluate particles with their
     own reward model, then pass those scores to :meth:`update_particles`.
@@ -27,6 +25,9 @@ class ParticlePolicy:
         self,
         num_particles: int = NUM_ACTION_PARTICLES,
         horizon: int = DEFAULT_PLANNING_HORIZON,
+        action_dim: int = FETCH_ACTION_DIM,
+        action_low: float | torch.Tensor = FETCH_ACTION_LOW,
+        action_high: float | torch.Tensor = FETCH_ACTION_HIGH,
     ) -> None:
         if isinstance(num_particles, bool) or not isinstance(num_particles, int):
             raise TypeError("num_particles must be an integer.")
@@ -38,6 +39,17 @@ class ParticlePolicy:
             raise ValueError("horizon must be positive.")
         self.num_particles = num_particles
         self.horizon = horizon
+        if action_dim <= 0:
+            raise ValueError("action_dim must be positive.")
+        self.action_dim = action_dim
+        self.action_low = torch.as_tensor(action_low, dtype=torch.float32).reshape(-1)
+        self.action_high = torch.as_tensor(action_high, dtype=torch.float32).reshape(-1)
+        if self.action_low.numel() == 1:
+            self.action_low = self.action_low.repeat(action_dim)
+        if self.action_high.numel() == 1:
+            self.action_high = self.action_high.repeat(action_dim)
+        if self.action_low.numel() != action_dim or self.action_high.numel() != action_dim:
+            raise ValueError("Action bounds must match action_dim.")
 
     def init_particles(
         self,
@@ -52,13 +64,15 @@ class ParticlePolicy:
             raise ValueError("batch_size must be positive.")
         if not torch.empty((), dtype=dtype).is_floating_point():
             raise TypeError("Particle dtype must be floating point.")
-        particles = PENDULUM_ACTION_MIDPOINT + INITIAL_PARTICLE_SIGMA * torch.randn(
-            (batch_size, self.num_particles, self.horizon, PENDULUM_ACTION_DIM),
+        low = self.action_low.to(device=device, dtype=dtype)
+        high = self.action_high.to(device=device, dtype=dtype)
+        particles = (low + high) / 2 + (high - low) / 4 * torch.randn(
+            (batch_size, self.num_particles, self.horizon, self.action_dim),
             dtype=dtype,
             device=device,
             generator=generator,
         )
-        return particles.clamp(PENDULUM_ACTION_LOW, PENDULUM_ACTION_HIGH)
+        return particles.clamp(low, high)
 
     def update_particles(
         self,
@@ -93,7 +107,7 @@ class ParticlePolicy:
             particles,
             dim=1,
             index=parent_indices[..., None, None].expand(
-                -1, -1, self.horizon, PENDULUM_ACTION_DIM
+                -1, -1, self.horizon, self.action_dim
             ),
         )
         if sigma == 0.0:
@@ -104,7 +118,9 @@ class ParticlePolicy:
             device=resampled.device,
             generator=generator,
         )
-        return (resampled + sigma * noise).clamp(PENDULUM_ACTION_LOW, PENDULUM_ACTION_HIGH)
+        low = self.action_low.to(device=resampled.device, dtype=resampled.dtype)
+        high = self.action_high.to(device=resampled.device, dtype=resampled.dtype)
+        return (resampled + sigma * noise).clamp(low, high)
 
     def _validate_particles(self, particles: torch.Tensor) -> None:
         if not isinstance(particles, torch.Tensor):
@@ -112,11 +128,11 @@ class ParticlePolicy:
         if particles.ndim != 4 or particles.shape[1:] != (
             self.num_particles,
             self.horizon,
-            PENDULUM_ACTION_DIM,
+            self.action_dim,
         ):
             raise ValueError(
                 f"particles must have shape (batch, {self.num_particles}, "
-                f"{self.horizon}, 1)."
+                f"{self.horizon}, {self.action_dim})."
             )
         if not torch.is_floating_point(particles):
             raise TypeError("particles must use a floating-point dtype.")
