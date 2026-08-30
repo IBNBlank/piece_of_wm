@@ -7,26 +7,19 @@ if [ -n "${PYTHON:-}" ]; then :
 elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then PYTHON="${VIRTUAL_ENV}/bin/python"
 else PYTHON="${SCRIPT_DIR}/.venv/bin/python"; fi
 if [ ! -x "${PYTHON}" ]; then
-  echo "[run_train_dreamer_like] error: Python executable not found: ${PYTHON}" >&2
+  echo "[run_pretrain_dreamer_like] error: Python executable not found: ${PYTHON}" >&2
   exit 1
 fi
 
 DATA_DIR="${DATA_DIR:-dataset/fetch-pick-and-place-random}"
-OUTPUT="${OUTPUT:-runs/dreamer_like/checkpoint.pt}"
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+OUTPUT="${OUTPUT:-runs/dreamer_like_pretrain/checkpoint.pt}"
 STEPS="${STEPS:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 HORIZON="${HORIZON:-16}"
 DEVICE="${DEVICE:-cpu}"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-echo "[run_train_dreamer_like] data_dir=${DATA_DIR} steps=${STEPS} batch_size=${BATCH_SIZE} horizon=${HORIZON} device=${DEVICE}"
-args=(
-  --data-dir "${DATA_DIR}" --steps "${STEPS}" --batch-size "${BATCH_SIZE}"
-  --horizon "${HORIZON}" --device "${DEVICE}" --output "${OUTPUT}"
-)
-if [ -n "${PRETRAINED_CHECKPOINT}" ]; then
-  args+=(--pretrained-checkpoint "${PRETRAINED_CHECKPOINT}")
-fi
+echo "[run_pretrain_dreamer_like] data_dir=${DATA_DIR} steps=${STEPS} batch_size=${BATCH_SIZE} horizon=${HORIZON} device=${DEVICE}"
 "${PYTHON}" -m dreamer_like.train \
-  "${args[@]}" "$@"
+  --data-dir "${DATA_DIR}" --steps "${STEPS}" --batch-size "${BATCH_SIZE}" \
+  --horizon "${HORIZON}" --device "${DEVICE}" --pretrain --output "${OUTPUT}" "$@"

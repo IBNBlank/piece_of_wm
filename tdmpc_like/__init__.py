@@ -12,6 +12,7 @@ from tdmpc_like.model import (
     WorldHeads,
     WorldModel,
 )
+from tdmpc_like.particle_policy import ParticlePolicy
 from tdmpc_like.training import (
     TensorEpisodeBatch,
     TensorTransitionBatch,
@@ -43,6 +44,7 @@ __all__ = [
     "WorldModelConfig",
     "WorldModelLosses",
     "WorldModelTrainer",
+    "ParticlePolicy",
     "append_history",
     "encode_sequence",
     "history_windows",

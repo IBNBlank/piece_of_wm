@@ -29,7 +29,7 @@ from utils.common import (
     seed_everything,
 )
 from utils.env import make_env
-from utils.particle_policy import ParticlePolicy
+from tdmpc_like.particle_policy import ParticlePolicy
 from utils.replay_buffer import EpisodeBatch, OfflineRolloutDataset, RolloutReplayBuffer
 
 

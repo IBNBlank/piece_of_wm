@@ -15,7 +15,7 @@ import torch
 
 from utils.common import seed_everything
 from utils.env import make_env, reset_env
-from utils.particle_policy import ParticlePolicy
+from tdmpc_like.particle_policy import ParticlePolicy
 
 
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -239,19 +239,48 @@ def run_online_episode(
     rewards: list[float] = []
     frames: list[Image.Image] = []
     predicted_rewards: list[float] = []
+    rssm_state = None
 
     for timestep in range(max_steps):
         observation_history, observation_valid = _observation_history(images, model)
         with torch.inference_mode():
-            observation = model.encoder(observation_history, observation_valid)
-            previous_action = torch.zeros((1, model.config.action_dim), device=observation.device, dtype=observation.dtype)
+            parameter = next(model.parameters())
+            previous_action = torch.zeros(
+                (1, model.config.action_dim),
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
             if actions:
-                previous_action = torch.as_tensor(actions[-1], device=observation.device, dtype=observation.dtype).reshape(1, -1)
-            if timestep == 0:
-                rssm_state = model.rssm_initial(1)
-            rssm_state, _, _ = model.rssm.observe_step(rssm_state, previous_action, observation)
-            action = model.actor(rssm_state.features, deterministic=True)
-            predicted_reward = model.heads.reward(rssm_state.z, action).squeeze(-1)
+                previous_action = torch.as_tensor(
+                    actions[-1], device=parameter.device, dtype=parameter.dtype
+                ).reshape(1, -1)
+            if model_name == "tdmpc_like":
+                action_history, action_valid = _action_history(actions, model)
+                latent = model.encode(
+                    observation_history, observation_valid, action_history, action_valid
+                )
+                action, predicted_reward = select_particle_action(
+                    model,
+                    latent,
+                    policy,
+                    particle_updates,
+                    particle_sigma,
+                    particle_temperature,
+                    generator,
+                )
+            else:
+                observation = model.encoder(observation_history, observation_valid)
+                if rssm_state is None:
+                    rssm_state = model.rssm.initial(
+                        1, device=observation.device, dtype=observation.dtype
+                    )
+                rssm_state, _, _ = model.rssm.observe_step(
+                    rssm_state, previous_action, observation
+                )
+                action = model.actor(rssm_state.features, deterministic=True)
+                predicted_reward = model.reward(
+                    torch.cat((rssm_state.features, action), dim=-1)
+                ).squeeze(-1)
         action_array = action.detach().cpu().numpy().reshape(model.config.action_shape)
         _, reward, terminated, truncated, _ = env.step(action_array)
         actions.append(action_array.astype(np.float32, copy=False))
